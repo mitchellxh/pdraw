@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""pdraw — one command for the whole Mac power story: PD contract, battery flow, SoC demand.
+
+Snapshot by default; -w for a live multi-series plot. Data engine: `macpow --json`
+(k06a/macpow, verified 2026-07-06). PD offer menu: ioreg AppleSmartBattery.
+Stdlib only; python3.9+.
+
+  pdraw              one-shot snapshot (~2s)
+  pdraw -w [SECS]    live plot, Ctrl-C or SECS to stop (default: until Ctrl-C)
+  pdraw top          exec the macpow TUI
+  pdraw --json       one merged sample as JSON (for scripts / logging)
+  pdraw --selftest   run built-in checks
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+from collections import deque
+
+BLOCKS = "▁▂▃▄▅▆▇█"
+# distinct color per plot item, no rainbow: supply cyan, demand yellow, gpu magenta,
+# battery green(charging)/red(draining)
+COLORS = {"supply": "36", "demand": "33", "gpu": "35"}
+TTY = sys.stdout.isatty()
+
+
+def c(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m" if TTY else s
+
+
+def spark(vals, width):
+    vals = list(vals)[-width:]
+    if not vals:
+        return ""
+    lo, hi = min(vals), max(vals)
+    span = max(hi - lo, 1.0)  # min 1W span: don't render mW noise as drama
+    return "".join(BLOCKS[min(7, int((v - lo) / span * 8))] for v in vals)
+
+
+def stream_objects(lines):
+    """Yield top-level JSON objects from macpow's pretty-printed concatenated stream."""
+    dec = json.JSONDecoder()
+    buf = ""
+    for line in lines:
+        buf += line
+        if line.strip() not in ("}", "}{"):
+            continue
+        s = buf.lstrip()
+        try:
+            obj, end = dec.raw_decode(s)
+        except ValueError:
+            continue
+        buf = s[end:]
+        yield obj
+
+
+def macpow_proc(interval_ms):
+    try:
+        return subprocess.Popen(
+            ["macpow", "--json", "--interval", str(interval_ms)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except FileNotFoundError:
+        sys.exit("pdraw: macpow not found — install: brew tap k06a/tap && brew install macpow")
+
+
+def valid_samples(proc):
+    for obj in stream_objects(proc.stdout):
+        if obj.get("soc", {}).get("total_w", 0) > 0:  # skip warm-up zeros
+            yield obj
+
+
+def pd_menu():
+    """Adapter PD offer menu from IORegistry — the one thing macpow doesn't expose."""
+    try:
+        out = subprocess.run(["ioreg", "-arn", "AppleSmartBattery"],
+                             capture_output=True, timeout=10).stdout
+        ad = plistlib.loads(out)[0].get("AdapterDetails", {})
+    except Exception:
+        return {}
+    return {
+        "menu": [(m.get("MaxVoltage", 0) / 1000, m.get("MaxCurrent", 0) / 1000)
+                 for m in ad.get("UsbHvcMenu", [])],
+        "tier": ad.get("AdapterPowerTier"),
+        "name": ad.get("Name") or ad.get("Description") or "",
+    }
+
+
+def max_temp(sample, category):
+    vals = [t["value_celsius"] for t in sample.get("temperatures", [])
+            if t.get("category") == category]
+    return max(vals) if vals else None
+
+
+def battery_flow_w(sample):
+    # macpow's drain_w is sign-unreliable (verified 2026-07-06); its raw amperage/voltage
+    # match ioreg exactly, so compute flow ourselves: positive = charging.
+    bat = sample.get("battery", {})
+    return bat.get("amperage_ma", 0.0) * bat.get("voltage_mv", 0.0) / 1e6
+
+
+def lane_values(sample):
+    return {
+        "supply": sample.get("adapter_power_w", 0.0),
+        "demand": sample.get("sys_power_w", 0.0),
+        "gpu": sample.get("soc", {}).get("gpu_w", 0.0),
+        "battery": battery_flow_w(sample),
+    }
+
+
+def snapshot(sample, menu):
+    soc, bat, ad = sample["soc"], sample["battery"], sample["adapter"]
+    lines = []
+
+    if ad.get("connected"):
+        v, a, w = ad["voltage_mv"] / 1000, ad["current_ma"] / 1000, ad["watts"]
+        epr = " EPR" if v > 21 else ""
+        name = f" · {menu['name']}" if menu.get("name") else ""
+        lines.append(f"⚡ {c('36','SUPPLY')}   contract {w:.0f}W · {v:g}V × {a:g}A{epr}"
+                     f" · delivering {sample.get('adapter_power_w', 0):.1f}W{name}")
+        if menu.get("menu"):
+            rungs = " · ".join(f"{v:g}V/{a:g}A" for v, a in menu["menu"])
+            lines.append(f"           offer menu: {rungs}")
+    else:
+        lines.append(f"⚡ {c('36','SUPPLY')}   ON BATTERY — no adapter connected")
+
+    flow = battery_flow_w(sample)
+    verb = "charging" if flow >= 0 else "draining"
+    left = (f" · est {bat['time_remaining_min']} min left"
+            if not ad.get("connected") and bat.get("time_remaining_min") else "")
+    lines.append(f"🔋 {c('32' if flow >= 0 else '31','BATTERY')}  {bat['percent']:.0f}%"
+                 f" · {verb} {abs(flow):.1f}W ({bat['amperage_ma']/1000:+.2f}A @ "
+                 f"{bat['voltage_mv']/1000:.2f}V) · {bat.get('temperature_c', 0):.0f}°C"
+                 f" · health {bat.get('health_pct', 0):.0f}% · {bat.get('cycle_count', '?')} cycles{left}")
+
+    parts = " + ".join(f"{k} {soc.get(k, 0):.1f}" for k in
+                       ("gpu_w", "cpu_w", "dram_w", "fabric_w")).replace("_w", "")
+    lines.append(f"🖥  {c('33','DEMAND')}   system {sample.get('sys_power_w', 0):.1f}W"
+                 f" · SoC {soc.get('total_w', 0):.1f}W → {parts}")
+    cpu_t, gpu_t = max_temp(sample, "CPU"), max_temp(sample, "GPU")
+    fans = "/".join(f"{f['actual_rpm']:.0f}" for f in sample.get("fans", []))
+    lines.append(f"           GPU {soc.get('gpu_util_device', 0)}% @ {soc.get('gpu_freq_mhz', 0)} MHz"
+                 + (f" · CPU {cpu_t:.0f}°C" if cpu_t else "")
+                 + (f" · GPU {gpu_t:.0f}°C" if gpu_t else "")
+                 + (f" · fans {fans} rpm" if fans else ""))
+
+    if ad.get("connected"):
+        head = sample.get("adapter_power_w", 0) - sample.get("sys_power_w", 0)
+        margin = ad["watts"] - sample.get("sys_power_w", 0)
+        state = "battery assisting" if flow < 0 else "surplus charging battery"
+        lines.append(f"⚖  HEADROOM delivered − demand = {head:+.1f}W"
+                     f" (contract margin {margin:+.1f}W) → {state}")
+    print("\n".join(lines))
+
+
+def watch(seconds, interval_ms):
+    proc = macpow_proc(interval_ms)
+    width = max(20, min(70, shutil.get_terminal_size().columns - 42))
+    hist = {k: deque(maxlen=width) for k in ("supply", "demand", "gpu", "battery")}
+    start, prev_lines = time.monotonic(), 0
+    try:
+        for sample in valid_samples(proc):
+            for k, v in lane_values(sample).items():
+                hist[k].append(v)
+            ad, bat = sample["adapter"], sample["battery"]
+            head = (f"⚡ contract {ad['watts']}W ({ad['voltage_mv']/1000:g}V×{ad['current_ma']/1000:g}A)"
+                    if ad.get("connected") else "⚡ ON BATTERY")
+            out = [f"{head} · batt {bat['percent']:.0f}% · {time.strftime('%H:%M:%S')}"]
+            for k in ("supply", "demand", "gpu", "battery"):
+                h = hist[k]
+                col = COLORS.get(k) or ("32" if h[-1] >= 0 else "31")
+                out.append(f"{c(col, k.ljust(7))} W {c(col, spark(h, width).ljust(width))}"
+                           f" {h[-1]:7.1f}  [{min(h):.1f} … {max(h):.1f}]")
+            if prev_lines:
+                sys.stdout.write(f"\x1b[{prev_lines}F")
+            sys.stdout.write("\n".join(l + "\x1b[K" for l in out) + "\n")
+            sys.stdout.flush()
+            prev_lines = len(out)
+            if seconds and time.monotonic() - start >= seconds:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+    if hist["demand"]:
+        n = len(hist["demand"])
+        print(f"— {n} samples · demand avg {sum(hist['demand'])/n:.1f}W · "
+              f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
+
+
+def one_sample(interval_ms=1000):
+    proc = macpow_proc(interval_ms)
+    try:
+        gen = valid_samples(proc)
+        next(gen)          # discard first valid sample: SMC/battery fields still settling
+        return next(gen)
+    except StopIteration:
+        sys.exit("pdraw: no data from macpow")
+    finally:
+        proc.terminate()
+
+
+def selftest():
+    s = spark([0, 1, 2, 3], 4)
+    assert s[0] == BLOCKS[0] and s[-1] == BLOCKS[-1], s
+    assert spark([5, 5], 10) == BLOCKS[0] * 2  # flat series doesn't crash
+    fake = json.dumps({"a": 1}, indent=2) + "\n" + json.dumps({"soc": {"total_w": 9}}, indent=2) + "\n"
+    objs = list(stream_objects(fake.splitlines(keepends=True)))
+    assert len(objs) == 2 and objs[1]["soc"]["total_w"] == 9, objs
+    assert lane_values({"adapter_power_w": 3, "sys_power_w": 7})["demand"] == 7
+    flow = battery_flow_w({"battery": {"amperage_ma": 5791, "voltage_mv": 12559}})
+    assert abs(flow - 72.73) < 0.01, flow  # charging = positive, matches ioreg convention
+    print("selftest OK")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pdraw", description=__doc__.splitlines()[0])
+    ap.add_argument("cmd", nargs="?", choices=["top"], help="top: launch macpow TUI")
+    ap.add_argument("-w", "--watch", nargs="?", const=0, type=float, metavar="SECS",
+                    help="live plot; optional duration (default: until Ctrl-C)")
+    ap.add_argument("-i", "--interval", type=int, default=1000, metavar="MS",
+                    help="sample interval ms (default 1000)")
+    ap.add_argument("--json", action="store_true", help="print one merged sample as JSON")
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+    if args.cmd == "top":
+        os.execvp("macpow", ["macpow"])
+    if args.watch is not None:
+        return watch(args.watch, args.interval)
+    sample = one_sample(args.interval)
+    if args.json:
+        sample["pd_offer_menu"] = pd_menu()
+        print(json.dumps(sample, indent=2))
+    else:
+        snapshot(sample, pd_menu())
+
+
+if __name__ == "__main__":
+    main()
