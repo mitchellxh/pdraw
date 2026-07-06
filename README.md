@@ -13,8 +13,9 @@ realtime chart and no PD offer menu; `ioreg` has the PD data but no rendering.
 
 ```
 pdraw              # snapshot (~2s)
-pdraw -w [SECS]    # live braille chart: supply/demand/gpu/battery overlaid, one color
-                   # each, PD contract as dashed reference line; Ctrl-C to stop
+pdraw -w [SECS]    # live 2x2 panel grid (mactop-style): supply / demand / gpu / battery,
+                   # each boxed with its own y-scale + color, PD contract as dashed
+                   # reference line; Ctrl-C to stop
 pdraw -i 250 -w    # faster sampling
 pdraw top          # exec the macpow TUI
 pdraw --json       # one merged sample as JSON (for scripts / logging)

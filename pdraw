@@ -150,22 +150,21 @@ def snapshot(sample, menu):
 
 # braille dot offsets by (row 0..3 top→bottom, column 0..1)
 BRAILLE = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
-CHART_H = 12  # cell rows → 48 dot rows
+PANEL_H = 5  # chart cell rows per panel → 20 dot rows
 
 
-def braille_chart(series, width, y_min, y_max, ref=None):
-    """Render overlaid line series onto a braille canvas. series = [(color, values)]
-    drawn in order (later on top). Returns list of chart lines with y-axis labels."""
-    px_w, px_h = width * 2, CHART_H * 4
-    bits = [[0] * width for _ in range(CHART_H)]
-    cols = [[None] * width for _ in range(CHART_H)]
+def braille_chart(vals, color, width, height, y_min, y_max, ref=None):
+    """One series on a braille canvas. Returns `height` rows of label(6)+chart(width)."""
+    px_w, px_h = width * 2, height * 4
+    bits = [[0] * width for _ in range(height)]
+    cols = [[None] * width for _ in range(height)]
     span = (y_max - y_min) or 1.0
 
-    def dot(px, py, color):  # py measured from bottom
+    def dot(px, py, dot_color):  # py measured from bottom
         if 0 <= px < px_w and 0 <= py < px_h:
             row = px_h - 1 - py
             bits[row // 4][px // 2] |= BRAILLE[row % 4][px % 2]
-            cols[row // 4][px // 2] = color
+            cols[row // 4][px // 2] = dot_color
 
     def to_py(v):
         return round((v - y_min) / span * (px_h - 1))
@@ -173,53 +172,71 @@ def braille_chart(series, width, y_min, y_max, ref=None):
     if ref is not None and y_min <= ref <= y_max:
         for px in range(0, px_w, 3):  # dashed reference line (e.g. PD contract)
             dot(px, to_py(ref), "90")
-    for color, vals in series:
-        pys = [to_py(v) for v in vals]
-        for i, py in enumerate(pys):
-            lo = min(py, pys[i - 1]) if i else py  # connect to previous sample
-            hi = max(py, pys[i - 1]) if i else py
-            for y in range(lo, hi + 1):
-                dot(px_w - len(pys) + i, y, color)
+    pys = [to_py(v) for v in vals]
+    for i, py in enumerate(pys):
+        lo = min(py, pys[i - 1]) if i else py  # connect to previous sample
+        hi = max(py, pys[i - 1]) if i else py
+        for y in range(lo, hi + 1):
+            dot(px_w - len(pys) + i, y, color)
 
     lines = []
-    for r in range(CHART_H):
-        y_here = y_max - (r + 0.5) / CHART_H * span
-        label = f"{y_here:5.0f}┤" if r in (0, CHART_H // 2, CHART_H - 1) else "     │"
+    for r in range(height):
+        y_here = y_max - (r + 0.5) / height * span
+        label = f"{y_here:5.0f}┤" if r in (0, height - 1) else "     │"
         row = "".join(c(cols[r][x], chr(0x2800 + bits[r][x])) if bits[r][x]
                       else " " for x in range(width))
         lines.append(label + row)
     return lines
 
 
+def panel(title, color, vals, width, y_min, y_max, ref=None):
+    """mactop-style bordered box: title in the frame, chart inside. No emoji in
+    titles — terminals render them double-width and break border alignment."""
+    inner = width + 6  # chart + y-axis labels
+    head = f" {title} "
+    top = "╭─" + c(color, head) + "─" * max(0, inner - len(head) - 1) + "╮"
+    body = ["│" + row + "│" for row in
+            braille_chart(vals, color, width, PANEL_H, y_min, y_max, ref)]
+    return [top] + body + ["╰" + "─" * inner + "╯"]
+
+
+def side_by_side(left, right):
+    return [l + " " + r for l, r in zip(left, right)]
+
+
 def watch(seconds, interval_ms):
     proc = macpow_proc(interval_ms)
-    width = max(30, min(110, shutil.get_terminal_size().columns - 8))
+    term_w = shutil.get_terminal_size().columns
+    width = max(24, min(80, (term_w - 2 * 9) // 2))  # per-panel chart cells
     hist = {k: deque(maxlen=width * 2) for k in ("supply", "demand", "gpu", "battery")}
     start, prev_lines, frame = time.monotonic(), 0, []
+
+    def rng(vals, hi_floor=None):  # per-panel scale: 0-anchored, padded, ≥2W tall
+        lo = min(0.0, min(vals))
+        hi = max(max(vals), hi_floor or 0) * 1.05 + 1
+        return lo, max(hi, lo + 2)
+
     try:
         for sample in valid_samples(proc):
             for k, v in lane_values(sample).items():
                 hist[k].append(v)
             ad, bat = sample["adapter"], sample["battery"]
             contract = ad["watts"] if ad.get("connected") else None
-            allv = [v for h in hist.values() for v in h] + ([contract] if contract else [])
-            y_min, y_max = min(0, min(allv)), max(allv) * 1.05 + 1
             bat_col = "32" if hist["battery"][-1] >= 0 else "31"
-            series = [(COLORS["gpu"], hist["gpu"]), (bat_col, hist["battery"]),
-                      (COLORS["supply"], hist["supply"]), (COLORS["demand"], hist["demand"])]
-            frame = [
-                "  " + " · ".join([
-                    (f"contract {contract}W ┄" if contract else "ON BATTERY"),
-                    c(COLORS["supply"], f"supply {hist['supply'][-1]:.1f}W"),
-                    c(COLORS["demand"], f"demand {hist['demand'][-1]:.1f}W"),
-                    c(COLORS["gpu"], f"gpu {hist['gpu'][-1]:.1f}W"),
-                    c(bat_col, f"batt {hist['battery'][-1]:+.1f}W"),
-                    f"{bat['percent']:.0f}%",
-                    time.strftime("%H:%M:%S"),
-                ]),
-                *braille_chart(series, width, y_min, y_max, ref=contract),
-                f"     └ {len(hist['demand'])} samples · {interval_ms}ms/sample",
-            ]
+            top = side_by_side(
+                panel(f"supply {hist['supply'][-1]:.1f}W", COLORS["supply"],
+                      hist["supply"], width, *rng(hist["supply"], contract), ref=contract),
+                panel(f"demand {hist['demand'][-1]:.1f}W", COLORS["demand"],
+                      hist["demand"], width, *rng(hist["demand"], contract), ref=contract))
+            bottom = side_by_side(
+                panel(f"gpu {hist['gpu'][-1]:.1f}W", COLORS["gpu"],
+                      hist["gpu"], width, *rng(hist["gpu"])),
+                panel(f"battery {hist['battery'][-1]:+.1f}W", bat_col,
+                      hist["battery"], width, *rng(hist["battery"]), ref=0))
+            status = (f"contract {contract}W ┄" if contract else "ON BATTERY")
+            frame = top + bottom + [
+                f" {status} · batt {bat['percent']:.0f}% · "
+                f"{len(hist['demand'])} samples @ {interval_ms}ms · {time.strftime('%H:%M:%S')}"]
             if TTY:
                 if prev_lines:
                     sys.stdout.write(f"\x1b[{prev_lines}F")
@@ -253,11 +270,13 @@ def one_sample(interval_ms=1000):
 
 
 def selftest():
-    chart = braille_chart([("36", [0, 10, 5, 10]), ("33", [10, 0, 10, 0])],
-                          width=10, y_min=0, y_max=10, ref=5)
-    assert len(chart) == CHART_H, len(chart)
-    assert any(0x2800 <= ord(ch) <= 0x28FF for line in chart for ch in line), chart
-    assert braille_chart([("36", [5, 5])], 10, 5, 5) is not None  # zero-span guard
+    box = panel("test", "36", [0, 10, 5, 10], width=10, y_min=0, y_max=10, ref=5)
+    assert len(box) == PANEL_H + 2, len(box)
+    assert box[0].startswith("╭") and box[-1].startswith("╰"), box
+    assert any(0x2800 <= ord(ch) <= 0x28FF for line in box for ch in line), box
+    assert panel("flat", "36", [5, 5], 10, 5, 5) is not None  # zero-span guard
+    joined = side_by_side(["a", "b"], ["c", "d"])
+    assert joined == ["a c", "b d"], joined
     fake = json.dumps({"a": 1}, indent=2) + "\n" + json.dumps({"soc": {"total_w": 9}}, indent=2) + "\n"
     objs = list(stream_objects(fake.splitlines(keepends=True)))
     assert len(objs) == 2 and objs[1]["soc"]["total_w"] == 9, objs
