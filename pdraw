@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
-"""pdraw — one command for the whole Mac power story: PD contract, battery flow, SoC demand.
+"""pdraw — instant, no-sudo Mac power read: what's delivered, what's pulled, battery flow.
 
-Snapshot by default; -w for a live multi-series plot. Data engine: `macpow --json`
-(k06a/macpow, verified 2026-07-06). PD offer menu: ioreg AppleSmartBattery.
-Stdlib only; python3.9+.
+Engine: AppleSMC read directly over IOKit (ctypes) — sub-millisecond, no root,
+no external tool. Power keys verified on this hardware 2026-07-06 by energy
+balance (PDTR delivered + battery ≈ PSTR system) and under CPU load:
+  PSTR = system total power (the pull)
+  PDTR = DC-in total power  (adapter delivering)
+  PHPS = compute-rail power (CPU/SoC package; tracks compute load)
+Battery %, health, temp, cycles + PD contract/offer menu come from ioreg
+AppleSmartBattery (also no sudo). Stdlib only; python3.9+.
 
-  pdraw              one-shot snapshot (~2s)
-  pdraw -w [SECS]    live plot, Ctrl-C or SECS to stop (default: until Ctrl-C)
-  pdraw top          exec the macpow TUI
-  pdraw --json       one merged sample as JSON (for scripts / logging)
+Earlier versions drove `macpow --json`, but its SoC watts read 0.0 on this chip
+(k06a/macpow issue #12) and the snapshot hung waiting for a nonzero sample.
+
+  pdraw              live 2x2 plot (watch), Ctrl-C to stop
+  pdraw -w SECS      watch for SECS then stop
+  pdraw --log FILE   watch + append each sample as JSONL to FILE
+  pdraw -s           one-shot snapshot (instant)
+  pdraw --json       one sample as JSON (for scripts / logging)
   pdraw --selftest   run built-in checks
+  pdraw top          exec the macpow TUI (if installed)
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
 import plistlib
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import time
 from collections import deque
 
-# distinct color per plot item, no rainbow: supply cyan, demand yellow, gpu magenta,
-# battery green(charging)/red(draining)
-COLORS = {"supply": "36", "demand": "33", "gpu": "35"}
+COLORS = {"supply": "36", "demand": "33", "compute": "35"}  # cyan / yellow / magenta
 TTY = sys.stdout.isatty()
 
 
@@ -32,122 +44,181 @@ def c(code, s):
     return f"\x1b[{code}m{s}\x1b[0m" if TTY else s
 
 
-def stream_objects(lines):
-    """Yield top-level JSON objects from macpow's pretty-printed concatenated stream."""
-    dec = json.JSONDecoder()
-    buf = ""
-    for line in lines:
-        buf += line
-        if line.strip() not in ("}", "}{"):
-            continue
-        s = buf.lstrip()
-        try:
-            obj, end = dec.raw_decode(s)
-        except ValueError:
-            continue
-        buf = s[end:]
-        yield obj
+# ── SMC engine: read AppleSMC 'flt ' keys directly over IOKit, no sudo ──────────
+# Two-call handshake per key (READ_KEYINFO for size/type, then READ_BYTES), the
+# same protocol istats/smckit use. argtypes/restype are mandatory: without them
+# ctypes assumes 32-bit int and truncates 64-bit pointers → segfault.
+_KERNEL_INDEX_SMC = 2
+_CMD_READ_BYTES = 5
+_CMD_READ_KEYINFO = 9
 
 
-def macpow_proc(interval_ms):
-    try:
-        return subprocess.Popen(
-            ["macpow", "--json", "--interval", str(interval_ms)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        )
-    except FileNotFoundError:
-        sys.exit("pdraw: macpow not found — install: brew tap k06a/tap && brew install macpow")
+class _Vers(ctypes.Structure):
+    _fields_ = [("major", ctypes.c_uint8), ("minor", ctypes.c_uint8),
+                ("build", ctypes.c_uint8), ("reserved", ctypes.c_uint8),
+                ("release", ctypes.c_uint16)]
 
 
-def valid_samples(proc):
-    for obj in stream_objects(proc.stdout):
-        if obj.get("soc", {}).get("total_w", 0) > 0:  # skip warm-up zeros
-            yield obj
+class _PLimit(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint16), ("length", ctypes.c_uint16),
+                ("cpuPLimit", ctypes.c_uint32), ("gpuPLimit", ctypes.c_uint32),
+                ("memPLimit", ctypes.c_uint32)]
 
 
-def pd_menu():
-    """Adapter PD offer menu from IORegistry — the one thing macpow doesn't expose."""
-    try:
-        out = subprocess.run(["ioreg", "-arn", "AppleSmartBattery"],
-                             capture_output=True, timeout=10).stdout
-        ad = plistlib.loads(out)[0].get("AdapterDetails", {})
-    except Exception:
-        return {}
+class _KeyInfo(ctypes.Structure):
+    _fields_ = [("dataSize", ctypes.c_uint32), ("dataType", ctypes.c_uint32),
+                ("dataAttributes", ctypes.c_uint8)]
+
+
+class _KeyData(ctypes.Structure):
+    _fields_ = [("key", ctypes.c_uint32), ("vers", _Vers), ("pLimitData", _PLimit),
+                ("keyInfo", _KeyInfo), ("result", ctypes.c_uint8),
+                ("status", ctypes.c_uint8), ("data8", ctypes.c_uint8),
+                ("data32", ctypes.c_uint32), ("bytes", ctypes.c_uint8 * 32)]
+
+
+def _fourcc(s):
+    return struct.unpack(">I", s.encode())[0]
+
+
+class SMC:
+    def __init__(self):
+        io = ctypes.CDLL(ctypes.util.find_library("IOKit"))
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        cvp, cu32, csz = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t
+        io.IOServiceMatching.restype = cvp
+        io.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        io.IOServiceGetMatchingService.restype = cu32
+        io.IOServiceGetMatchingService.argtypes = [cu32, cvp]
+        io.IOServiceOpen.restype = ctypes.c_int
+        io.IOServiceOpen.argtypes = [cu32, cu32, cu32, ctypes.POINTER(cu32)]
+        io.IOConnectCallStructMethod.restype = ctypes.c_int
+        io.IOConnectCallStructMethod.argtypes = [cu32, cu32, cvp, csz, cvp,
+                                                 ctypes.POINTER(csz)]
+        libc.mach_task_self.restype = cu32
+        self._io = io
+        svc = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+        if not svc:
+            raise OSError("AppleSMC service not found")
+        self.conn = cu32()
+        r = io.IOServiceOpen(svc, libc.mach_task_self(), 0, ctypes.byref(self.conn))
+        if r != 0:
+            raise OSError(f"IOServiceOpen failed: {r:#x}")
+
+    def _call(self, inp):
+        out = _KeyData()
+        osz = ctypes.c_size_t(ctypes.sizeof(_KeyData))
+        r = self._io.IOConnectCallStructMethod(
+            self.conn, _KERNEL_INDEX_SMC, ctypes.byref(inp), ctypes.sizeof(_KeyData),
+            ctypes.byref(out), ctypes.byref(osz))
+        if r != 0:
+            raise OSError(f"SMC call failed: {r:#x}")
+        return out
+
+    def read_flt(self, key):
+        inp = _KeyData(); inp.key = _fourcc(key); inp.data8 = _CMD_READ_KEYINFO
+        info = self._call(inp)
+        size, dtype = info.keyInfo.dataSize, info.keyInfo.dataType
+        inp = _KeyData(); inp.key = _fourcc(key)
+        inp.keyInfo.dataSize = size; inp.data8 = _CMD_READ_BYTES
+        raw = bytes(self._call(inp).bytes[:size])
+        if struct.pack(">I", dtype) != b"flt ":
+            raise ValueError(f"{key}: type {struct.pack('>I', dtype)!r}, not 'flt '")
+        return struct.unpack("<f", raw[:4])[0]
+
+
+# ── data acquisition ────────────────────────────────────────────────────────────
+def ioreg_battery():
+    """Battery + adapter contract + PD offer menu from ioreg AppleSmartBattery."""
+    out = subprocess.run(["ioreg", "-a", "-r", "-n", "AppleSmartBattery"],
+                         capture_output=True, timeout=10).stdout
+    d = plistlib.loads(out)[0]
+    ad = d.get("AdapterDetails", {})
+    tr = d.get("TimeRemaining")
+    design = d.get("DesignCapacity") or 0
     return {
-        "menu": [(m.get("MaxVoltage", 0) / 1000, m.get("MaxCurrent", 0) / 1000)
-                 for m in ad.get("UsbHvcMenu", [])],
-        "tier": ad.get("AdapterPowerTier"),
-        "name": ad.get("Name") or ad.get("Description") or "",
+        "battery": {
+            "percent": d.get("CurrentCapacity", 0),
+            "amperage_ma": d.get("Amperage", 0),      # signed: <0 discharging
+            "voltage_mv": d.get("Voltage", 0),
+            "temperature_c": d.get("Temperature", 0) / 100,
+            "health_pct": round(100 * d.get("AppleRawMaxCapacity", 0) / design) if design else 0,
+            "cycle_count": d.get("CycleCount", "?"),
+            "time_remaining_min": tr if tr and tr < 65535 else None,
+        },
+        "adapter": {
+            "connected": bool(d.get("ExternalConnected")),
+            "watts": ad.get("Watts", 0),
+            "voltage_mv": ad.get("AdapterVoltage", 0),
+            "current_ma": ad.get("Current", 0),
+            "name": ad.get("Description") or ad.get("Name") or "",
+            "menu": [(m.get("MaxVoltage", 0) / 1000, m.get("MaxCurrent", 0) / 1000)
+                     for m in ad.get("UsbHvcMenu", [])],
+        },
     }
 
 
-def max_temp(sample, category):
-    vals = [t["value_celsius"] for t in sample.get("temperatures", [])
-            if t.get("category") == category]
-    return max(vals) if vals else None
-
-
-def battery_flow_w(sample):
-    # macpow's drain_w is sign-unreliable (verified 2026-07-06); its raw amperage/voltage
-    # match ioreg exactly, so compute flow ourselves: positive = charging.
-    bat = sample.get("battery", {})
+def battery_flow_w(bat):
+    # positive = charging. ioreg amperage is signed and matches the true direction.
     return bat.get("amperage_ma", 0.0) * bat.get("voltage_mv", 0.0) / 1e6
 
 
-def lane_values(sample):
-    return {
-        "supply": sample.get("adapter_power_w", 0.0),
-        "demand": sample.get("sys_power_w", 0.0),
-        "gpu": sample.get("soc", {}).get("gpu_w", 0.0),
-        "battery": battery_flow_w(sample),
-    }
+def read_sample(smc):
+    p = smc.read_flt
+    s = ioreg_battery()
+    connected = s["adapter"]["connected"]
+    s["sys_power_w"] = p("PSTR")                       # the pull
+    s["adapter_power_w"] = p("PDTR") if connected else 0.0  # delivering
+    s["compute_w"] = p("PHPS")                          # CPU/SoC compute rail
+    s["battery_flow_w"] = battery_flow_w(s["battery"])
+    return s
 
 
-def snapshot(sample, menu):
-    soc, bat, ad = sample["soc"], sample["battery"], sample["adapter"]
+def lane_values(s):
+    return {"supply": s["adapter_power_w"], "demand": s["sys_power_w"],
+            "compute": s["compute_w"], "battery": s["battery_flow_w"]}
+
+
+# ── snapshot ─────────────────────────────────────────────────────────────────────
+def snapshot(s):
+    ad, bat = s["adapter"], s["battery"]
+    pull, deliver, flow = s["sys_power_w"], s["adapter_power_w"], s["battery_flow_w"]
     lines = []
 
-    if ad.get("connected"):
+    if ad["connected"]:
         v, a, w = ad["voltage_mv"] / 1000, ad["current_ma"] / 1000, ad["watts"]
         epr = " EPR" if v > 21 else ""
-        name = f" · {menu['name']}" if menu.get("name") else ""
+        name = f" · {ad['name']}" if ad["name"] else ""
         lines.append(f"⚡ {c('36','SUPPLY')}   contract {w:.0f}W · {v:g}V × {a:g}A{epr}"
-                     f" · delivering {sample.get('adapter_power_w', 0):.1f}W{name}")
-        if menu.get("menu"):
-            rungs = " · ".join(f"{v:g}V/{a:g}A" for v, a in menu["menu"])
+                     f" · delivering {deliver:.1f}W{name}")
+        if ad["menu"]:
+            rungs = " · ".join(f"{v:g}V/{a:g}A" for v, a in ad["menu"])
             lines.append(f"           offer menu: {rungs}")
     else:
         lines.append(f"⚡ {c('36','SUPPLY')}   ON BATTERY — no adapter connected")
 
-    flow = battery_flow_w(sample)
     verb = "charging" if flow >= 0 else "draining"
     left = (f" · est {bat['time_remaining_min']} min left"
-            if not ad.get("connected") and bat.get("time_remaining_min") else "")
+            if not ad["connected"] and bat.get("time_remaining_min") else "")
     lines.append(f"🔋 {c('32' if flow >= 0 else '31','BATTERY')}  {bat['percent']:.0f}%"
                  f" · {verb} {abs(flow):.1f}W ({bat['amperage_ma']/1000:+.2f}A @ "
-                 f"{bat['voltage_mv']/1000:.2f}V) · {bat.get('temperature_c', 0):.0f}°C"
-                 f" · health {bat.get('health_pct', 0):.0f}% · {bat.get('cycle_count', '?')} cycles{left}")
+                 f"{bat['voltage_mv']/1000:.2f}V) · {bat['temperature_c']:.0f}°C"
+                 f" · health {bat['health_pct']:.0f}% · {bat['cycle_count']} cycles{left}")
 
-    parts = " + ".join(f"{k} {soc.get(k, 0):.1f}" for k in
-                       ("gpu_w", "cpu_w", "dram_w", "fabric_w")).replace("_w", "")
-    lines.append(f"🖥  {c('33','DEMAND')}   system {sample.get('sys_power_w', 0):.1f}W"
-                 f" · SoC {soc.get('total_w', 0):.1f}W → {parts}")
-    cpu_t, gpu_t = max_temp(sample, "CPU"), max_temp(sample, "GPU")
-    fans = "/".join(f"{f['actual_rpm']:.0f}" for f in sample.get("fans", []))
-    lines.append(f"           GPU {soc.get('gpu_util_device', 0)}% @ {soc.get('gpu_freq_mhz', 0)} MHz"
-                 + (f" · CPU {cpu_t:.0f}°C" if cpu_t else "")
-                 + (f" · GPU {gpu_t:.0f}°C" if gpu_t else "")
-                 + (f" · fans {fans} rpm" if fans else ""))
+    lines.append(f"🖥  {c('33','DEMAND')}   system pull {pull:.1f}W"
+                 f" · compute rail {s['compute_w']:.1f}W")
 
-    if ad.get("connected"):
-        head = sample.get("adapter_power_w", 0) - sample.get("sys_power_w", 0)
-        margin = ad["watts"] - sample.get("sys_power_w", 0)
-        state = "battery assisting" if flow < 0 else "surplus charging battery"
-        lines.append(f"⚖  HEADROOM delivered − demand = {head:+.1f}W"
+    if ad["connected"]:
+        head = deliver - pull
+        margin = ad["watts"] - pull
+        state = ("battery assisting" if flow < -0.5 else
+                 "surplus charging battery" if flow > 0.5 else "balanced")
+        lines.append(f"⚖  HEADROOM delivered − pull = {head:+.1f}W"
                      f" (contract margin {margin:+.1f}W) → {state}")
     print("\n".join(lines))
 
 
+# ── braille chart (presentation, unchanged) ──────────────────────────────────────
 # braille dot offsets by (row 0..3 top→bottom, column 0..1)
 BRAILLE = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
 PANEL_H = 5  # chart cell rows per panel → 20 dot rows
@@ -204,24 +275,50 @@ def side_by_side(left, right):
     return [l + " " + r for l, r in zip(left, right)]
 
 
-def watch(seconds, interval_ms):
-    proc = macpow_proc(interval_ms)
-    term_w = shutil.get_terminal_size().columns
-    width = max(24, min(80, (term_w - 2 * 9) // 2))  # per-panel chart cells
-    hist = {k: deque(maxlen=width * 2) for k in ("supply", "demand", "gpu", "battery")}
-    start, prev_lines, frame = time.monotonic(), 0, []
+# ── watch ────────────────────────────────────────────────────────────────────────
+LANES = ("supply", "demand", "compute", "battery")
+
+
+def panel_width():  # per-panel chart cells, from the live terminal width
+    return max(24, min(80, (shutil.get_terminal_size().columns - 2 * 9) // 2))
+
+
+def watch(seconds, interval_ms, log_path=None):
+    try:
+        smc = SMC()
+    except OSError as e:
+        sys.exit(f"pdraw: cannot read power — {e}")
+    logf = open(log_path, "a") if log_path else None  # JSONL, one sample per line
+    width = panel_width()
+    hist = {k: deque(maxlen=width * 2) for k in LANES}
+    start, frame = time.monotonic(), []
 
     def rng(vals, hi_floor=None):  # per-panel scale: 0-anchored, padded, ≥2W tall
         lo = min(0.0, min(vals))
         hi = max(max(vals), hi_floor or 0) * 1.05 + 1
         return lo, max(hi, lo + 2)
 
+    def _on_term(*_):  # `kill` would skip the finally and strand the terminal in
+        raise KeyboardInterrupt  # the alt-screen; reroute it through the same teardown
+
+    if TTY:  # run inside the alternate screen buffer, like mactop/htop: the live
+        signal.signal(signal.SIGTERM, _on_term)  # view is ephemeral, restored on exit
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # enter alt-screen, hide cursor
+        sys.stdout.flush()
     try:
-        for sample in valid_samples(proc):
-            for k, v in lane_values(sample).items():
+        while True:
+            s = read_sample(smc)
+            if logf:  # append + flush per line: tail-able live, kill loses at most one line
+                logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
+                logf.flush()
+            w = panel_width()
+            if w != width:  # terminal resized: re-flow panels, re-cap history to fit
+                width = w   # deque(old, maxlen=n) keeps the most recent n samples
+                hist = {k: deque(hist[k], maxlen=width * 2) for k in LANES}
+            for k, v in lane_values(s).items():
                 hist[k].append(v)
-            ad, bat = sample["adapter"], sample["battery"]
-            contract = ad["watts"] if ad.get("connected") else None
+            ad, bat = s["adapter"], s["battery"]
+            contract = ad["watts"] if ad["connected"] else None
             bat_col = "32" if hist["battery"][-1] >= 0 else "31"
             top = side_by_side(
                 panel(f"supply {hist['supply'][-1]:.1f}W", COLORS["supply"],
@@ -229,86 +326,94 @@ def watch(seconds, interval_ms):
                 panel(f"demand {hist['demand'][-1]:.1f}W", COLORS["demand"],
                       hist["demand"], width, *rng(hist["demand"], contract), ref=contract))
             bottom = side_by_side(
-                panel(f"gpu {hist['gpu'][-1]:.1f}W", COLORS["gpu"],
-                      hist["gpu"], width, *rng(hist["gpu"])),
+                panel(f"compute {hist['compute'][-1]:.1f}W", COLORS["compute"],
+                      hist["compute"], width, *rng(hist["compute"])),
                 panel(f"battery {hist['battery'][-1]:+.1f}W", bat_col,
                       hist["battery"], width, *rng(hist["battery"]), ref=0))
-            status = (f"contract {contract}W ┄" if contract else "ON BATTERY")
+            status = f"contract {contract}W ┄" if contract else "ON BATTERY"
             frame = top + bottom + [
                 f" {status} · batt {bat['percent']:.0f}% · "
                 f"{len(hist['demand'])} samples @ {interval_ms}ms · {time.strftime('%H:%M:%S')}"]
-            if TTY:
-                if prev_lines:
-                    sys.stdout.write(f"\x1b[{prev_lines}F")
-                sys.stdout.write("\n".join(l + "\x1b[K" for l in frame) + "\n")
+            if TTY:  # redraw from home + clear-to-end: resilient to resize/clear,
+                sys.stdout.write(  # no prev_lines bookkeeping to drift out of sync
+                    "\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
                 sys.stdout.flush()
-                prev_lines = len(frame)
             if seconds and time.monotonic() - start >= seconds:
                 break
+            time.sleep(interval_ms / 1000)
     except KeyboardInterrupt:
         pass
     finally:
-        proc.terminate()
-    if not TTY and frame:
+        if TTY:  # always restore — Ctrl-C, -w timeout, SIGTERM, or error
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")  # show cursor, leave alt-screen
+            sys.stdout.flush()
+        if logf:
+            logf.close()
+    if not TTY and frame:  # piped/captured: residue is the point — keep the record
         print("\n".join(frame))
-    if hist["demand"]:
-        n = len(hist["demand"])
-        print(f"— {n} samples · demand avg {sum(hist['demand'])/n:.1f}W · "
-              f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
+        if hist["demand"]:
+            n = len(hist["demand"])
+            print(f"— {n} samples · demand avg {sum(hist['demand'])/n:.1f}W · "
+                  f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
 
 
-def one_sample(interval_ms=1000):
-    proc = macpow_proc(interval_ms)
-    try:
-        gen = valid_samples(proc)
-        next(gen)          # discard first valid sample: SMC/battery fields still settling
-        return next(gen)
-    except StopIteration:
-        sys.exit("pdraw: no data from macpow")
-    finally:
-        proc.terminate()
-
-
+# ── selftest ─────────────────────────────────────────────────────────────────────
 def selftest():
+    assert _fourcc("PSTR") == 0x50535452, hex(_fourcc("PSTR"))
+    assert abs(struct.unpack("<f", bytes([0x6c, 0xe8, 0xe5, 0x41]))[0] - 28.738) < 0.01
     box = panel("test", "36", [0, 10, 5, 10], width=10, y_min=0, y_max=10, ref=5)
     assert len(box) == PANEL_H + 2, len(box)
     assert box[0].startswith("╭") and box[-1].startswith("╰"), box
     assert any(0x2800 <= ord(ch) <= 0x28FF for line in box for ch in line), box
     assert panel("flat", "36", [5, 5], 10, 5, 5) is not None  # zero-span guard
-    joined = side_by_side(["a", "b"], ["c", "d"])
-    assert joined == ["a c", "b d"], joined
-    fake = json.dumps({"a": 1}, indent=2) + "\n" + json.dumps({"soc": {"total_w": 9}}, indent=2) + "\n"
-    objs = list(stream_objects(fake.splitlines(keepends=True)))
-    assert len(objs) == 2 and objs[1]["soc"]["total_w"] == 9, objs
-    assert lane_values({"adapter_power_w": 3, "sys_power_w": 7})["demand"] == 7
-    flow = battery_flow_w({"battery": {"amperage_ma": 5791, "voltage_mv": 12559}})
-    assert abs(flow - 72.73) < 0.01, flow  # charging = positive, matches ioreg convention
-    print("selftest OK")
+    assert side_by_side(["a", "b"], ["c", "d"]) == ["a c", "b d"]
+    flow = battery_flow_w({"amperage_ma": 5791, "voltage_mv": 12559})
+    assert abs(flow - 72.73) < 0.01, flow          # charging = positive
+    assert battery_flow_w({"amperage_ma": -413, "voltage_mv": 13007}) < 0  # draining = negative
+    rec = json.dumps({**{"adapter": {"menu": [(5.0, 3.0)]}, "sys_power_w": 1.5}, "t": 123.4},
+                     separators=(",", ":"))  # a log line: nested dict + tuple menu → one JSONL line
+    assert "\n" not in rec and json.loads(rec)["t"] == 123.4, rec
+    try:  # live read if on real hardware — energy balance sanity
+        s = read_sample(SMC())
+        assert s["sys_power_w"] > 0, s["sys_power_w"]
+        print(f"selftest OK (live: pull {s['sys_power_w']:.1f}W, "
+              f"deliver {s['adapter_power_w']:.1f}W)")
+    except OSError as e:
+        print(f"selftest OK (offline: {e})")
 
 
 def main():
     ap = argparse.ArgumentParser(prog="pdraw", description=__doc__.splitlines()[0])
     ap.add_argument("cmd", nargs="?", choices=["top"], help="top: launch macpow TUI")
     ap.add_argument("-w", "--watch", nargs="?", const=0, type=float, metavar="SECS",
-                    help="live plot; optional duration (default: until Ctrl-C)")
-    ap.add_argument("-i", "--interval", type=int, default=1000, metavar="MS",
-                    help="sample interval ms (default 1000)")
-    ap.add_argument("--json", action="store_true", help="print one merged sample as JSON")
+                    help="watch duration in seconds (default: until Ctrl-C)")
+    ap.add_argument("-s", "--snapshot", action="store_true",
+                    help="one-shot snapshot instead of the live plot")
+    ap.add_argument("--log", metavar="PATH",
+                    help="append each sample as JSONL to PATH while watching")
+    ap.add_argument("-i", "--interval", type=int, default=500, metavar="MS",
+                    help="sample interval ms (default 500)")
+    ap.add_argument("--json", action="store_true", help="print one sample as JSON")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
     if args.cmd == "top":
+        if not shutil.which("macpow"):
+            sys.exit("pdraw: macpow not installed — brew tap k06a/tap && brew install macpow")
         os.execvp("macpow", ["macpow"])
-    if args.watch is not None:
-        return watch(args.watch, args.interval)
-    sample = one_sample(args.interval)
-    if args.json:
-        sample["pd_offer_menu"] = pd_menu()
-        print(json.dumps(sample, indent=2))
-    else:
-        snapshot(sample, pd_menu())
+    if (args.snapshot or args.json) and not args.log:  # one-shot paths; --log forces the loop
+        try:
+            sample = read_sample(SMC())
+        except OSError as e:
+            sys.exit(f"pdraw: cannot read power — {e}")
+        if args.json:
+            print(json.dumps(sample, indent=2))
+        else:
+            snapshot(sample)
+        return
+    return watch(args.watch, args.interval, args.log)
 
 
 if __name__ == "__main__":
