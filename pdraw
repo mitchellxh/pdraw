@@ -36,7 +36,7 @@ import sys
 import time
 from collections import deque
 
-COLORS = {"supply": "36", "demand": "33", "compute": "35"}  # cyan / yellow / magenta
+COLORS = {"draw": "33", "charger": "36", "compute": "35"}  # yellow / cyan / magenta
 TTY = sys.stdout.isatty()
 
 
@@ -175,15 +175,15 @@ def read_sample(smc):
 
 
 def lane_values(s):
-    return {"supply": s["adapter_power_w"], "demand": s["sys_power_w"],
+    return {"draw": s["sys_power_w"], "charger": s["adapter_power_w"],
             "compute": s["compute_w"], "battery": s["battery_flow_w"]}
 
 
 # ── snapshot ─────────────────────────────────────────────────────────────────────
 # Verdict-first glance view: the headline IS the story — are we gaining or losing
-# ground, by how much. `battery_flow_w` is the true signed net (it leads); the two
-# bars below show *why* (demand vs what the charger delivers), so the reader sees a
-# single deficit number, not two. Bars share one scale so the crossover is visible.
+# ground, by how much. `battery_flow_w` is the true signed net (it leads); the
+# ledger below shows *why* (draw vs what the charger delivers, both under rated),
+# so the reader sees a single deficit number, not two. Bars share one scale.
 _EIGHTHS = " ▏▎▍▌▋▊▉"  # 0..7 eighths of a cell; index 0 is blank
 
 
@@ -337,7 +337,7 @@ def side_by_side(left, right):
 
 
 # ── watch ────────────────────────────────────────────────────────────────────────
-LANES = ("supply", "demand", "compute", "battery")
+LANES = ("draw", "charger", "compute", "battery")
 
 
 def panel_width():  # per-panel chart cells, from the live terminal width
@@ -379,22 +379,22 @@ def watch(seconds, interval_ms, log_path=None):
             for k, v in lane_values(s).items():
                 hist[k].append(v)
             ad, bat = s["adapter"], s["battery"]
-            contract = ad["watts"] if ad["connected"] else None
+            rated = ad["watts"] if ad["connected"] else None
             bat_col = "32" if hist["battery"][-1] >= 0 else "31"
             top = side_by_side(
-                panel(f"supply {hist['supply'][-1]:.1f}W", COLORS["supply"],
-                      hist["supply"], width, *rng(hist["supply"], contract), ref=contract),
-                panel(f"demand {hist['demand'][-1]:.1f}W", COLORS["demand"],
-                      hist["demand"], width, *rng(hist["demand"], contract), ref=contract))
+                panel(f"draw {hist['draw'][-1]:.1f}W", COLORS["draw"],
+                      hist["draw"], width, *rng(hist["draw"], rated), ref=rated),
+                panel(f"charger {hist['charger'][-1]:.1f}W", COLORS["charger"],
+                      hist["charger"], width, *rng(hist["charger"], rated), ref=rated))
             bottom = side_by_side(
                 panel(f"compute {hist['compute'][-1]:.1f}W", COLORS["compute"],
                       hist["compute"], width, *rng(hist["compute"])),
                 panel(f"battery {hist['battery'][-1]:+.1f}W", bat_col,
                       hist["battery"], width, *rng(hist["battery"]), ref=0))
-            status = f"contract {contract}W ┄" if contract else "ON BATTERY"
+            status = f"rated {rated}W ┄" if rated else "ON BATTERY"
             frame = top + bottom + [
                 f" {status} · batt {bat['percent']:.0f}% · "
-                f"{len(hist['demand'])} samples @ {interval_ms}ms · {time.strftime('%H:%M:%S')}"]
+                f"{len(hist['draw'])} samples @ {interval_ms}ms · {time.strftime('%H:%M:%S')}"]
             if TTY:  # redraw from home + clear-to-end: resilient to resize/clear,
                 sys.stdout.write(  # no prev_lines bookkeeping to drift out of sync
                     "\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
@@ -412,9 +412,9 @@ def watch(seconds, interval_ms, log_path=None):
             logf.close()
     if not TTY and frame:  # piped/captured: residue is the point — keep the record
         print("\n".join(frame))
-        if hist["demand"]:
-            n = len(hist["demand"])
-            print(f"— {n} samples · demand avg {sum(hist['demand'])/n:.1f}W · "
+        if hist["draw"]:
+            n = len(hist["draw"])
+            print(f"— {n} samples · draw avg {sum(hist['draw'])/n:.1f}W · "
                   f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
 
 

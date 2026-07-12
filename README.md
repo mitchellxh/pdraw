@@ -14,7 +14,7 @@ adapter detail come from `ioreg`.
 ## Usage
 
 ```
-pdraw              # live 2x2 plot: supply / demand / compute / battery,
+pdraw              # live 2x2 plot: draw / charger / compute / battery,
                    # each boxed with its own scale; Ctrl-C to stop
 pdraw -w SECS      # watch for SECS then stop
 pdraw --log FILE   # watch and append each sample as JSONL to FILE
