@@ -22,7 +22,7 @@ pdraw -i 250       # sample interval in ms (default 500)
 pdraw -s           # one-shot snapshot
 pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
-pdraw top          # run macpow's TUI, if installed
+pdraw top          # run mactop, if installed
 ```
 
 Snapshot (`pdraw -s`):
@@ -50,7 +50,8 @@ net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
 ## Requirements
 
 - Apple Silicon Mac, python3 (stdlib only). Nothing to install, no sudo.
-- `pdraw top` runs macpow if you have it; everything else is self-contained.
+- `pdraw top` runs [mactop](https://github.com/metaspartan/mactop) if you have it
+  (`brew install mactop`); everything else is self-contained.
 
 ## Install
 

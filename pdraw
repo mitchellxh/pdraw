@@ -19,7 +19,7 @@ Earlier versions drove `macpow --json`, but its SoC watts read 0.0 on this chip
   pdraw -s           one-shot snapshot (instant)
   pdraw --json       one sample as JSON (for scripts / logging)
   pdraw --selftest   run built-in checks
-  pdraw top          exec the macpow TUI (if installed)
+  pdraw top          exec the mactop TUI (if installed)
 """
 
 import argparse
@@ -465,7 +465,7 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(prog="pdraw", description=__doc__.splitlines()[0])
-    ap.add_argument("cmd", nargs="?", choices=["top"], help="top: launch macpow TUI")
+    ap.add_argument("cmd", nargs="?", choices=["top"], help="top: launch the mactop TUI")
     ap.add_argument("-w", "--watch", nargs="?", const=0, type=float, metavar="SECS",
                     help="watch duration in seconds (default: until Ctrl-C)")
     ap.add_argument("-s", "--snapshot", action="store_true",
@@ -481,9 +481,9 @@ def main():
     if args.selftest:
         return selftest()
     if args.cmd == "top":
-        if not shutil.which("macpow"):
-            sys.exit("pdraw: macpow not installed — brew tap k06a/tap && brew install macpow")
-        os.execvp("macpow", ["macpow"])
+        if not shutil.which("mactop"):
+            sys.exit("pdraw: mactop not installed — brew install mactop")
+        os.execvp("mactop", ["mactop"])
     if (args.snapshot or args.json) and not args.log:  # one-shot paths; --log forces the loop
         try:
             sample = read_sample(SMC())
