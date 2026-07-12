@@ -25,18 +25,27 @@ pdraw --selftest   # built-in checks
 pdraw top          # run macpow's TUI, if installed
 ```
 
-Snapshot:
+Snapshot (`pdraw -s`):
 
 ```
-⚡ SUPPLY   contract 140W · 28V × 5A EPR · delivering 131.6W · pd charger
-           offer menu: 5V/3A · 9V/3A · 15V/3A · 20V/5A
-🔋 BATTERY  68% · draining 8.6W (-0.72A @ 12.03V) · 30°C · health 98% · 44 cycles
-🖥  DEMAND   system pull 136.3W · compute rail 92.2W
-⚖  HEADROOM delivered − pull = -4.7W (contract margin +3.7W) → battery assisting
+  ●  Net drain                             -8.6 W
+
+     battery  68 %
+     draw    136 W   ███████████████████████████▎
+     charger 132 W   ██████████████████████████▎
+     rated   140 W   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 ```
 
-Watch the headroom line. When it's negative the battery is draining while macOS
-says it's charging, which is what an undersized charger does.
+The header is the whole story: `Net drain` with a negative number means the
+battery is losing charge while plugged in — an undersized charger. The ledger
+shows why: the charger delivers less than the system draws, and both sit under
+the charger's rated ceiling. `battery` / `draw` / `charger` bars share one scale
+(the charger's rated max, shown as the dim ceiling). Piped or non-interactive,
+`-s` collapses to one line:
+
+```
+net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
+```
 
 ## Requirements
 

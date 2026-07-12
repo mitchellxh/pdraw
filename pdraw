@@ -180,42 +180,103 @@ def lane_values(s):
 
 
 # ── snapshot ─────────────────────────────────────────────────────────────────────
-def snapshot(s):
+# Verdict-first glance view: the headline IS the story — are we gaining or losing
+# ground, by how much. `battery_flow_w` is the true signed net (it leads); the two
+# bars below show *why* (demand vs what the charger delivers), so the reader sees a
+# single deficit number, not two. Bars share one scale so the crossover is visible.
+_EIGHTHS = " ▏▎▍▌▋▊▉"  # 0..7 eighths of a cell; index 0 is blank
+
+
+def _bar(frac, color, width=28):
+    """Track-less fill bar: a colored █ run plus one fractional cap, space-padded
+    to `width` visible cells (padding stays uncolored so length math is trivial)."""
+    frac = max(0.0, min(1.0, frac))
+    filled = frac * width
+    full = int(filled)
+    cap = _EIGHTHS[int((filled - full) * 8)] if full < width else ""
+    fill = "█" * full + cap
+    return c(color, fill) + " " * (width - len(fill))
+
+
+def _time_hint(s):
+    tr = s["battery"].get("time_remaining_min")
+    if not tr:
+        return ""
+    return f"~{tr}m to full" if s["battery_flow_w"] > 0.5 else f"~{tr}m left"
+
+
+def _verdict(s):
+    """(word, color) — the headline state."""
+    flow, conn = s["battery_flow_w"], s["adapter"]["connected"]
+    if not conn:
+        return "On battery", "33"
+    if flow < -0.5:
+        return "Net drain", "31"
+    if flow > 0.5:
+        return "Net charge", "32"
+    return "Balanced", "37"
+
+
+# ledger geometry: indent(5) + label(8) + value(5) + gap(3) + bar(28) = 49 wide.
+# The header's signed-watt value right-aligns to that same column 49.
+_LEDGER_W, _BAR_W = 49, 28
+
+
+def _header(word, col, flow):
+    watts = f"{flow:+.1f} W"
+    gap = max(2, _LEDGER_W - 5 - len(word) - len(watts))
+    return f"  {c(col, '●')}  {c(col, word)}{' ' * gap}{c(col, watts)}"
+
+
+def _row(label, value, unit, bar="", dim=False):
+    """One ledger row: label, right-aligned value+unit, then its bar — all columns
+    aligned. Padding is on visible text, so `bar`'s color codes never shift it."""
+    lab, val = f"{label:<8}", f"{value:>3.0f} {unit}"
+    if dim:
+        lab, val = c("90", lab), c("90", val)
+    return f"     {lab}{val}   {bar}".rstrip()
+
+
+def _snapshot_lines(s):
     ad, bat = s["adapter"], s["battery"]
-    pull, deliver, flow = s["sys_power_w"], s["adapter_power_w"], s["battery_flow_w"]
-    lines = []
+    flow, pull, deliver = s["battery_flow_w"], s["sys_power_w"], s["adapter_power_w"]
+    word, col = _verdict(s)
+    lines = ["", _header(word, col, flow), ""]  # leading blank + gap under header = air
 
-    if ad["connected"]:
-        v, a, w = ad["voltage_mv"] / 1000, ad["current_ma"] / 1000, ad["watts"]
-        epr = " EPR" if v > 21 else ""
-        name = f" · {ad['name']}" if ad["name"] else ""
-        lines.append(f"⚡ {c('36','SUPPLY')}   contract {w:.0f}W · {v:g}V × {a:g}A{epr}"
-                     f" · delivering {deliver:.1f}W{name}")
-        if ad["menu"]:
-            rungs = " · ".join(f"{v:g}V/{a:g}A" for v, a in ad["menu"])
-            lines.append(f"           offer menu: {rungs}")
-    else:
-        lines.append(f"⚡ {c('36','SUPPLY')}   ON BATTERY — no adapter connected")
+    if not ad["connected"]:  # no rated ceiling to scale watt bars against → numbers only
+        ctx = ([_time_hint(s)] if _time_hint(s) else []) + [f"{bat['temperature_c']:.0f}°C"]
+        return lines + [_row("battery", bat["percent"], "%"),
+                        _row("draw", pull, "W"),
+                        "     " + c("90", " · ".join(ctx))]
 
-    verb = "charging" if flow >= 0 else "draining"
-    left = (f" · est {bat['time_remaining_min']} min left"
-            if not ad["connected"] and bat.get("time_remaining_min") else "")
-    lines.append(f"🔋 {c('32' if flow >= 0 else '31','BATTERY')}  {bat['percent']:.0f}%"
-                 f" · {verb} {abs(flow):.1f}W ({bat['amperage_ma']/1000:+.2f}A @ "
-                 f"{bat['voltage_mv']/1000:.2f}V) · {bat['temperature_c']:.0f}°C"
-                 f" · health {bat['health_pct']:.0f}% · {bat['cycle_count']} cycles{left}")
+    scale = max(ad["watts"], pull, deliver) or 1.0        # shared scale; rated = the ceiling
+    return lines + [
+        _row("battery", bat["percent"], "%"),             # a %, not watts → no bar in this column
+        _row("draw", pull, "W", _bar(pull / scale, "33", _BAR_W)),
+        _row("charger", deliver, "W", _bar(deliver / scale, "36", _BAR_W)),
+        _row("rated", ad["watts"], "W", c("90", "░" * _BAR_W), dim=True),  # dim ceiling reference
+    ]
 
-    lines.append(f"🖥  {c('33','DEMAND')}   system pull {pull:.1f}W"
-                 f" · compute rail {s['compute_w']:.1f}W")
 
-    if ad["connected"]:
-        head = deliver - pull
-        margin = ad["watts"] - pull
-        state = ("battery assisting" if flow < -0.5 else
-                 "surplus charging battery" if flow > 0.5 else "balanced")
-        lines.append(f"⚖  HEADROOM delivered − pull = {head:+.1f}W"
-                     f" (contract margin {margin:+.1f}W) → {state}")
-    print("\n".join(lines))
+def _status_line(s):
+    """One-line form: non-TTY / pipe output (and, later, the live-plot footer)."""
+    word, _ = _verdict(s)
+    flow, pull, deliver = s["battery_flow_w"], s["sys_power_w"], s["adapter_power_w"]
+    pct, rated = s["battery"]["percent"], s["adapter"]["watts"]
+    hint = _time_hint(s)
+    tail = f" · {hint}" if hint else ""
+    if not s["adapter"]["connected"]:
+        return f"on battery · {pct:.0f}% · {pull:.0f} W draw{tail}"
+    if flow < -0.5:
+        return (f"net drain {abs(flow):.1f} W · {pct:.0f}% · "
+                f"draw {pull:.0f} W vs charger {deliver:.0f} W (rated {rated:.0f} W)")
+    if flow > 0.5:
+        return f"net charge {flow:.0f} W · {pct:.0f}% · charging{tail}"
+    return f"balanced · {pct:.0f}% · draw {pull:.0f} W ≈ charger {deliver:.0f} W"
+
+
+def snapshot(s):
+    print("\n".join(_snapshot_lines(s)) if TTY else _status_line(s))
 
 
 # ── braille chart (presentation, unchanged) ──────────────────────────────────────
@@ -373,6 +434,26 @@ def selftest():
     rec = json.dumps({**{"adapter": {"menu": [(5.0, 3.0)]}, "sys_power_w": 1.5}, "t": 123.4},
                      separators=(",", ":"))  # a log line: nested dict + tuple menu → one JSONL line
     assert "\n" not in rec and json.loads(rec)["t"] == 123.4, rec
+    assert _bar(0.5, "36", 10).count("█") == 5, _bar(0.5, "36", 10)  # half-fill, no track
+    assert _bar(2, "36", 10) == c("36", "█" * 10), "over-range clamps to full"
+    fake = {"adapter": {"connected": True, "watts": 140, "voltage_mv": 28000,
+                        "current_ma": 4700, "name": "pd charger", "menu": [(5, 3), (20, 5)]},
+            "battery": {"percent": 68, "amperage_ma": -720, "voltage_mv": 12030,
+                        "temperature_c": 30, "health_pct": 98, "cycle_count": 44,
+                        "time_remaining_min": None},
+            "sys_power_w": 136.3, "adapter_power_w": 131.6, "compute_w": 92.2,
+            "battery_flow_w": -8.6}  # plugged, draining → the money case
+    snap = _snapshot_lines(fake)
+    assert any("Net drain" in ln for ln in snap), snap
+    assert any("█" in ln for ln in snap), snap                    # bars rendered
+    assert sum(1 for ln in snap if "rated" in ln) == 1, snap      # ceiling row present
+    assert "net drain 8.6 W" in _status_line(fake), _status_line(fake)
+    onbat = {**fake, "adapter": {**fake["adapter"], "connected": False},
+             "battery": {**fake["battery"], "time_remaining_min": 92},
+             "sys_power_w": 22.4, "battery_flow_w": -22.4}
+    assert any("On battery" in ln for ln in _snapshot_lines(onbat))
+    assert not any("█" in ln for ln in _snapshot_lines(onbat))    # no watt bars off-adapter
+    assert "on battery" in _status_line(onbat) and "92m left" in _status_line(onbat)
     try:  # live read if on real hardware — energy balance sanity
         s = read_sample(SMC())
         assert s["sys_power_w"] > 0, s["sys_power_w"]
