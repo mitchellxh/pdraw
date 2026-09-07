@@ -435,6 +435,18 @@ _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("MEM MB", 9, "rss_mb", lambda v: f"{v:.0f}"))
 
 
+def next_sort(key, reverse, action):
+    """Same column -> flip direction. A different column -> start descending,
+    since the first thing anyone wants from a new metric is its biggest values."""
+    want = SORT_KEYS[action]
+    return (want, not reverse) if want == key else (want, True)
+
+
+def _heat(frac):
+    """Dim -> plain -> warm -> hot as a value approaches the top of the screen."""
+    return "90" if frac < 0.15 else "37" if frac < 0.40 else "33" if frac < 0.70 else "31"
+
+
 def sort_rows(rows, key="energy", reverse=True):
     """Sort by any column. Rows whose value is unreadable always sort last,
     in both directions -- an unknown is not a small value."""
@@ -447,45 +459,35 @@ def sort_rows(rows, key="energy", reverse=True):
     return known + unknown
 
 
-def proc_table(rows, sort_key="energy", reverse=True, name_w=26):
+_BARW = 14
+
+
+def proc_table(rows, sort_key="energy", reverse=True, name_w=26, show_energy=True):
     """Process table. The active sort column is marked so the view says how it
     is ordered rather than leaving the reader to guess."""
+    cols = [col for col in _COLS if col[2] != "energy" or show_energy]
     mark = "▼" if reverse else "▲"
-    widths = [w or name_w for _, w, _, _ in _COLS]
-    heads = [lbl + (mark if key == sort_key else "") for lbl, _, key, _ in _COLS]
+    widths = [w or name_w for _, w, _, _ in cols]
+    heads = [lbl + (mark if key == sort_key else "") for lbl, _, key, _ in cols]
     head = (f"     {heads[0]:>{widths[0]}}  {heads[1]:<{widths[1]}}"
-            + "".join(f"{h:>{w}}" for h, w in zip(heads[2:], widths[2:])))
-    out = [head, "     " + "─" * (len(head) - 5)]
+            + "".join(f"{h:>{w}}" for h, w in zip(heads[2:], widths[2:]))
+            + f"  {'SHARE':<{_BARW}}")
+    out = [c("90", head), "     " + c("90", "─" * (len(head) - 5))]
+    # the bar tracks whichever column is sorted, scaled to the largest value on
+    # screen -- the same "share of the visible maximum" idea as the snapshot bars
+    vals = [r.get(sort_key) for r in rows if isinstance(r.get(sort_key), (int, float))]
+    top = max(vals) if vals else 0
     for r in rows:
         tail = "".join(f"{('—' if r.get(k) is None else fmt(r[k])):>{w}}"
-                       for (_, _, k, fmt), w in zip(_COLS[2:], widths[2:]))
-        out.append(f"     {r['pid']:>{widths[0]}}  "
-                   f"{r['name'][:name_w]:<{widths[1]}}" + tail)
+                       for (_, _, k, fmt), w in zip(cols[2:], widths[2:]))
+        v = r.get(sort_key)
+        frac = (v / top) if top and isinstance(v, (int, float)) else 0.0
+        bar = _bar(frac, _heat(frac), _BARW) if frac >= 0.08 else " " * _BARW
+        pid_cell = f"{r['pid']:>{widths[0]}}"
+        out.append(f"     {c('90', pid_cell)}  "
+                   f"{r['name'][:name_w]:<{widths[1]}}"
+                   + c(_heat(frac), tail) + "  " + bar)
     return out
-
-
-def rank_tasks(frame, limit=12, rss=None, sort_key="energy", reverse=True):
-    """Top tasks from one powermetrics frame, ranked by energy impact.
-
-    Energy, not CPU: low CPU is the *absence* of a signal, so it cannot tell an
-    idle daemon from a job that has handed its work to the GPU. Energy rises for
-    either path, which is the only positive signal macOS gives us here.
-
-    Rows with a negative pid are powermetrics' synthetic aggregates
-    (DEAD_TASKS, ALL_TASKS) and are not processes.
-    """
-    rss = rss or proc_rss_mb
-    rows = []
-    for t in frame.get("tasks") or []:
-        pid = t.get("pid", -1)
-        if pid < 0:
-            continue
-        rows.append({"pid": pid, "name": t.get("name", "?"),
-                     "cpu_ms_s": t.get("cputime_ms_per_s", 0.0),
-                     "energy": t.get("energy_impact_per_s", t.get("energy_impact", 0.0)),
-                     "rss_mb": rss(pid)})
-    rows = sort_rows(rows, sort_key, reverse)
-    return rows[:limit] if limit else rows
 
 
 # ── per-process memory: proc_pidinfo over ctypes ────────────────────────────────
@@ -510,13 +512,79 @@ _LIBPROC.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, _U64,
                                   ctypes.c_void_p, ctypes.c_int]
 
 
-def proc_rss_mb(pid):
-    """Resident memory in MB, or None when the process isn't ours to read."""
+_PROC_ALL_PIDS = 1
+_LIBPROC.proc_listpids.argtypes = [_U32, _U32, ctypes.c_void_p, ctypes.c_int]
+_LIBPROC.proc_name.argtypes = [ctypes.c_int, ctypes.c_char_p, _U32]
+
+
+def list_pids():
+    """Every pid on the machine (no sudo). Reading them is a separate question."""
+    need = _LIBPROC.proc_listpids(_PROC_ALL_PIDS, 0, None, 0)
+    if need <= 0:
+        return []
+    buf = (ctypes.c_int32 * (need // 4))()
+    got = _LIBPROC.proc_listpids(_PROC_ALL_PIDS, 0, buf, need)
+    return [p for p in buf[:max(got, 0) // 4] if p > 0]
+
+
+def proc_name(pid):
+    buf = ctypes.create_string_buffer(256)
+    if _LIBPROC.proc_name(pid, buf, 256) > 0:
+        return buf.value.decode("utf-8", "replace")
+    return None
+
+
+def _task_info(pid):
     info = _ProcTaskInfo()
     size = ctypes.sizeof(_ProcTaskInfo)
-    if _LIBPROC.proc_pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(info), size) != size:
-        return None                      # unreadable -> caller shows "—", never 0
-    return info.pti_resident_size / 2**20
+    ok = _LIBPROC.proc_pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(info), size)
+    return info if ok == size else None
+
+
+class Processes:
+    """Per-process CPU and memory with NO sudo, via libproc.
+
+    proc_pidinfo reads every process we own (measured 379 of 624 on this
+    machine); the rest belong to other users and are simply not listed, because
+    a row whose numbers we cannot read is not information.
+
+    CPU is a delta of cumulative task time, so the first sample is a baseline.
+    """
+
+    def __init__(self):
+        self._prev, self._t = {}, time.monotonic()
+
+    def sample(self):
+        now = time.monotonic()
+        dt = max(now - self._t, 1e-6)
+        cur, rows = {}, []
+        for pid in list_pids():
+            info = _task_info(pid)
+            if info is None:
+                continue
+            cpu_ns = info.pti_total_user + info.pti_total_system
+            cur[pid] = cpu_ns
+            was = self._prev.get(pid)
+            rows.append({
+                "pid": pid,
+                "name": proc_name(pid) or "?",
+                "cpu_ms_s": ((cpu_ns - was) / 1e6) / dt if was is not None else 0.0,
+                "rss_mb": info.pti_resident_size / 2**20,
+                "energy": None,          # only powermetrics-as-root can fill this
+            })
+        self._prev, self._t = cur, now
+        return rows
+
+
+def merge_energy(rows, pm_frame):
+    """Fold powermetrics energy impact into libproc rows, matched on pid."""
+    if not pm_frame:
+        return rows
+    by_pid = {t["pid"]: t.get("energy_impact_per_s", 0.0)
+              for t in (pm_frame.get("tasks") or []) if t.get("pid", -1) >= 0}
+    for r in rows:
+        r["energy"] = by_pid.get(r["pid"])
+    return rows
 
 
 def host_or_none():
@@ -989,66 +1057,68 @@ def watch(seconds, interval_ms, log_path=None):
                   f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
 
 
-# ── procs: per-process view (opt-in, the only path that uses sudo) ──────────────
-def procs_lines(pm_frame, gpu, s, view=12, off=0, sort_key="energy", reverse=True):
-    """Header of global state, then a scrollable window into the ranked table."""
+# ── procs: per-process view ─────────────────────────────────────────────────────
+# CPU, memory, names and the pid list all come from libproc with no sudo. Only
+# IMPACT needs powermetrics as root, so it is opt-in (--energy) rather than a
+# toll everyone pays: one column's requirement should not be the view's.
+def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_ms_s", reverse=True,
+                show_energy=False):
+    """Header of global state, then a sorted, scrollable window of processes."""
     bits = []
     if gpu:
         bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gpu['mem_inuse_gb']:.1f} GB"]
     bits.append(f"{s['sys_power_w']:.0f} W draw")
     head = ["", f"  {c('32', '●')}  " + " · ".join(bits), ""]
-    if not pm_frame:
-        return head + ["     waiting for the first powermetrics sample…"]
-    rows = rank_tasks(pm_frame, limit=None, sort_key=sort_key, reverse=reverse)
-    window = rows[off:off + view]
-    shown = f"{off + 1}-{off + len(window)} of {len(rows)}" if window else "none"
-    nav = " · jk/↑↓ scroll · c/e/m/p/n sort · r reverse · q quit"
-    return (head + proc_table(window, sort_key, reverse)
+    if not rows:
+        return head + ["     no readable processes"]
+    ordered = sort_rows(rows, sort_key, reverse)
+    window = ordered[off:off + view]
+    shown = f"{off + 1}-{off + len(window)} of {len(ordered)}" if window else "none"
+    keys = "c/m/p/n" + ("/e" if show_energy else "")
+    nav = f" · jk/↑↓ scroll · {keys} sort (again to flip) · q quit"
+    return (head + proc_table(window, sort_key, reverse, show_energy=show_energy)
             + ["     " + c("90", shown + nav)])
 
 
-def procs(seconds, interval_ms):
-    """Live per-process view, ranked by energy.
+def procs(seconds, interval_ms, want_energy=False):
+    """Live per-process view.
 
-    No per-process GPU exists on Apple Silicon, so energy is the ranking: low
-    CPU is the *absence* of a signal and cannot separate an idle daemon from a
-    job that handed its work to the GPU.
+    Ranked by CPU by default. With --energy it also shows Apple's Energy Impact
+    score, which is the only per-process signal that moves when work shifts to
+    the GPU -- macOS exposes no per-process GPU or VRAM on Apple Silicon at all.
     """
-    if not shutil.which("powermetrics"):
-        sys.exit("pdraw: powermetrics not found (it ships with macOS)")
     try:
         smc = SMC()
     except OSError as e:
         sys.exit(f"pdraw: cannot read power — {e}")
-    interval_ms = max(interval_ms, 1000)   # powermetrics is costly; don't hammer it
-    host, bat_cache = host_or_none(), BatteryCache()
-    # Prime sudo BEFORE the alt-screen: the prompt must land on the real screen,
-    # and caching the credential lets the child's noisy stderr be silenced.
-    quiet = sudo_prime(PowerMetrics.argv())
-    if not quiet:
-        print("pdraw: sudo credential not cached — powermetrics warnings will show.")
-    pm = PowerMetrics(quiet=quiet)
-    give_up = time.monotonic() + 60
-    while pm.poll() is None and time.monotonic() < give_up:
-        if pm.proc and pm.proc.poll() is not None:
-            sys.exit("pdraw: powermetrics exited (sudo declined?)")
-        time.sleep(0.2)
+    host, bat_cache, source = host_or_none(), BatteryCache(), Processes()
+    pm, quiet = None, True
+    if want_energy:
+        if not shutil.which("powermetrics"):
+            sys.exit("pdraw: powermetrics not found (it ships with macOS)")
+        # Prime sudo BEFORE the alt-screen: the prompt must land on the real
+        # screen, and caching lets the child's noisy stderr be silenced.
+        quiet = sudo_prime(PowerMetrics.argv())
+        if not quiet:
+            print("pdraw: sudo not cached — powermetrics warnings will show.")
+        pm = PowerMetrics(quiet=quiet)
 
     def _on_term(*_):
         raise KeyboardInterrupt
 
     keys = None
     off, start, frame, done = 0, time.monotonic(), [], False
-    sort_key, reverse = "energy", True
+    sort_key, reverse = ("energy" if want_energy else "cpu_ms_s"), True
+    source.sample()          # CPU is a delta; discard the baseline sample
 
     def view_rows():
         return max(3, shutil.get_terminal_size().lines - 10)
 
-    def render(pm_frame, sample):
-        out = procs_lines(pm_frame, sample.get("gpu"), sample, view_rows(), off,
-                          sort_key, reverse)
-        note = (f"     energy ranks · no per-process GPU on Apple Silicon · "
-                f"{time.strftime('%H:%M:%S')}")
+    def render(rows, sample):
+        out = procs_lines(rows, sample.get("gpu"), sample, view_rows(), off,
+                          sort_key, reverse, show_energy=want_energy)
+        note = (f"     {'IMPACT is a unitless score, not watts · ' if want_energy else ''}"
+                f"no per-process GPU on Apple Silicon · {time.strftime('%H:%M:%S')}")
         out += ["", c("90", note)]
         if TTY:
             sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in out) + "\x1b[J")
@@ -1058,8 +1128,8 @@ def procs(seconds, interval_ms):
     try:
         if TTY:
             signal.signal(signal.SIGTERM, _on_term)
-            # cbreak inside the try: an exception before it would otherwise
-            # strand the terminal with no echo and no line editing
+            # cbreak inside the try: an exception before the guard would
+            # otherwise strand the terminal with no echo and no line editing
             if sys.stdin.isatty():
                 keys = KeyReader()
             sys.stdout.write("\x1b[?1049h\x1b[?25l")
@@ -1067,11 +1137,12 @@ def procs(seconds, interval_ms):
         while not done:
             tick = time.monotonic()
             sample = read_sample(smc, host, bat_cache)
-            pm_frame = pm.poll()
-            frame = render(pm_frame, sample)
-            total = len(rank_tasks(pm_frame, limit=None)) if pm_frame else 0
-            # poll keys far faster than we sample: powermetrics runs at >=1s, but
-            # navigation that lagged a whole second would feel broken
+            rows = source.sample()
+            if pm:
+                rows = merge_energy(rows, pm.poll())
+            frame = render(rows, sample)
+            # poll keys far faster than we sample: navigation that lagged a whole
+            # refresh would feel broken
             while time.monotonic() - tick < interval_ms / 1000:
                 if keys:
                     acts = parse_keys(keys.pending())
@@ -1083,11 +1154,13 @@ def procs(seconds, interval_ms):
                             if a == "reverse":
                                 reverse = not reverse
                             elif a in SORT_KEYS:
-                                sort_key = SORT_KEYS[a]
-                                off = 0     # a new ordering starts at its top
+                                if SORT_KEYS[a] == "energy" and not want_energy:
+                                    continue          # column isn't shown
+                                sort_key, reverse = next_sort(sort_key, reverse, a)
+                                off = 0               # new ordering starts at its top
                             else:
-                                off = scroll_clamp(off, a, total, view_rows())
-                        frame = render(pm_frame, sample)
+                                off = scroll_clamp(off, a, len(rows), view_rows())
+                        frame = render(rows, sample)
                 if seconds and time.monotonic() - start >= seconds:
                     done = True
                     break
@@ -1100,7 +1173,7 @@ def procs(seconds, interval_ms):
         if TTY:
             sys.stdout.write("\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
-        left = pm.close()
+        left = pm.close() if pm else None
         if left:   # root-owned survivor we cannot kill ourselves — say so
             print(f"pdraw: powermetrics still running as root (pid {' '.join(left)}); "
                   f"stop it with: sudo kill {' '.join(left)}")
@@ -1215,6 +1288,24 @@ def selftest():
     assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
     assert group_caption("gpu", rich) is None      # nothing group-scoped to show
 
+    # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
+    # needs root, so it must not hold the whole view hostage
+    src = Processes()
+    src.sample()                       # first sample establishes the CPU baseline
+    live_rows = src.sample()
+    assert live_rows, "libproc must enumerate our processes"
+    assert all({"pid", "name", "cpu_ms_s", "rss_mb"} <= set(r) for r in live_rows)
+    assert any(r["pid"] == os.getpid() for r in live_rows), "our own process must appear"
+    assert all(r["energy"] is None for r in live_rows), "no energy without powermetrics"
+    assert all(r["rss_mb"] > 0 for r in live_rows), "we only list what we can read"
+
+    # energy merges in by pid when powermetrics IS available
+    merged = merge_energy([{"pid": 11, "energy": None}, {"pid": 99, "energy": None}],
+                          {"tasks": [{"pid": 11, "energy_impact_per_s": 7.5},
+                                     {"pid": -1, "energy_impact_per_s": 999.0}]})
+    assert merged[0]["energy"] == 7.5, merged
+    assert merged[1]["energy"] is None, "pid absent from the frame stays unknown"
+
     # units belong in the header, not repeated per row; and IMPACT is Apple's
     # unitless Energy Impact score -- NOT watts (measured: task impacts sum to
     # 464-2223 while the machine drew 20-40 W, and impact/cpu varies 36x)
@@ -1249,26 +1340,23 @@ def selftest():
     up = next(l for l in proc_table(trows, sort_key="cpu_ms_s", reverse=False) if "PID" in l)
     assert "▲" in up, up
 
+    # pressing a sort key twice flips direction; a different key starts descending
+    assert next_sort("energy", True, "sort_cpu") == ("cpu_ms_s", True)
+    assert next_sort("cpu_ms_s", True, "sort_cpu") == ("cpu_ms_s", False)
+    assert next_sort("cpu_ms_s", False, "sort_cpu") == ("cpu_ms_s", True)
+    assert next_sort("cpu_ms_s", False, "sort_mem") == ("rss_mb", True)
+
+    # a bar on the sorted column, scaled to the largest value on screen, so the
+    # table carries the same visual grammar as pdraw's snapshot ledger
+    barred = proc_table(trows, sort_key="cpu_ms_s")
+    assert "█" in next(l for l in barred if "python3.12" in l), barred
+    assert "█" not in next(l for l in barred if "distnoted" in l), "tiny value, no bar"
+
     # sort keys reach parse_keys
     assert parse_keys("c") == ["sort_cpu"]
     assert parse_keys("e") == ["sort_energy"]
     assert parse_keys("m") == ["sort_mem"]
     assert parse_keys("r") == ["reverse"]
-
-    # tasks ranked by energy (CPU% cannot discriminate: an idle audio daemon and a
-    # GPU-bound job both show low CPU). Synthetic aggregate rows must be dropped --
-    # real output carries DEAD_TASKS (pid -1) and ALL_TASKS (pid -2).
-    frame = {"tasks": [
-        {"pid": 10, "name": "quiet", "cputime_ms_per_s": 5.0, "energy_impact_per_s": 1.0},
-        {"pid": 11, "name": "busy", "cputime_ms_per_s": 2.0, "energy_impact_per_s": 90.0},
-        {"pid": -1, "name": "DEAD_TASKS", "cputime_ms_per_s": 30.0, "energy_impact_per_s": 5.0},
-        {"pid": -2, "name": "ALL_TASKS", "cputime_ms_per_s": 99.0, "energy_impact_per_s": 99.0},
-    ]}
-    ranked = rank_tasks(frame, limit=5, rss=lambda pid: 4.0 if pid == 11 else None)
-    assert [r["pid"] for r in ranked] == [11, 10], ranked   # energy order, not CPU
-    assert ranked[0]["rss_mb"] == 4.0 and ranked[1]["rss_mb"] is None, ranked
-    assert ranked[0]["name"] == "busy" and ranked[0]["cpu_ms_s"] == 2.0
-    assert len(rank_tasks(frame, limit=1, rss=lambda p: None)) == 1, "limit honoured"
 
     # powermetrics -f plist emits NUL-separated frames. The reader must yield only
     # complete frames and hold a partial tail across chunk boundaries -- a frame
@@ -1347,12 +1435,6 @@ def selftest():
     assert pm.poll()["tasks"][0]["pid"] == 2, "no new frame -> hold the last"
     assert pm.close() is None, "no child was spawned, so nothing to reap"
 
-    # per-process RSS via proc_pidinfo: free and fork-less, but readable only for
-    # processes we own. Root-owned daemons must report unknown, never a bogus 0.
-    assert proc_rss_mb(os.getpid()) > 0, proc_rss_mb(os.getpid())
-    assert proc_rss_mb(1) is None, "launchd is root-owned -> unreadable"
-    assert proc_rss_mb(2 ** 30) is None, "nonexistent pid"
-
     # battery is re-read on wall-clock, not per tick: the gauge moves every ~35s
     # (measured), so per-tick polling re-forked ioreg ~70x per real change
     calls, clock = [], [100.0]
@@ -1404,13 +1486,15 @@ def main():
     ap.add_argument("-i", "--interval", type=int, default=500, metavar="MS",
                     help="sample interval ms (default 500)")
     ap.add_argument("--json", action="store_true", help="print one sample as JSON")
+    ap.add_argument("--energy", action="store_true",
+                    help="procs: add Apple's Energy Impact column (needs sudo)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
     if args.cmd == "procs":
-        return procs(args.watch, args.interval)
+        return procs(args.watch, args.interval, args.energy)
     if args.cmd == "top":
         if not shutil.which("mactop"):
             sys.exit("pdraw: mactop not installed — brew install mactop")
