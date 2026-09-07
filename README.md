@@ -97,9 +97,29 @@ the obvious places and wrongly conclude it does not exist.
 
 `GPU%` is time-on-GPU as a share of wall clock, the same convention as `CPU%`.
 Processes that hold GPU clients but are not ours to read — `WindowServer` above
-all — are still listed, with `—` for CPU and memory. There is still no
-per-process *VRAM*: unified memory means GPU allocations are wired system pages,
-reported globally only.
+all — are still listed, with `—` for CPU and memory.
+
+### Why there is no per-process VRAM column
+
+Not because the data is unavailable — it is. Walking a process's VM regions with
+`proc_pidinfo(PROC_PIDREGIONINFO)` and summing those tagged
+`VM_MEMORY_IOACCELERATOR` (100) or `VM_MEMORY_IOSURFACE` (88) gives a real
+per-process figure, with no sudo.
+
+It is left out for two measured reasons:
+
+1. **It does not mean what it would appear to mean.** Summed across every
+   process holding GPU clients it came to 0.33 GB while `ioreg` reported 30.09 GB
+   in use — 91x apart. Both are correct; most GPU memory is kernel-side driver
+   allocation that is never mapped into a process. A column reading `152 MB`
+   under a header reading `30.1 GB` invites the inference that it is that
+   process's share of it. It is not, and nothing on screen would say so.
+2. **It costs ~15 ms per process** — one syscall per VM region, no bulk API, and
+   a busy process has thousands of regions. Even limited to the visible rows
+   that is ~150 ms a tick.
+
+The global `gpu mem` figure in the header is verified to track real GPU work: it
+moved 1.8 -> 31.2 GB as utilization went 40% -> 99% while system RAM stayed flat.
 
 `MEM` shows `—` for processes you do not own: `proc_pidinfo` reads all 200/200 of
 your own processes but none belonging to other users, and a `0` there would be a
