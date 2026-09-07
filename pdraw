@@ -275,14 +275,45 @@ class Host:
         return {"cpu_pct": cpu, "ram_gb": _ram_gb(v.active, v.wire, v.compressor)}
 
 
+BATTERY_POLL_S = 2.0   # AppleSmartBattery refreshes every ~35s (measured on this
+                       # hardware 2026-09-07: gaps min 35.0s, max 35.0s). Polling it
+                       # per 500ms tick re-forked ioreg ~70x per real change at ~18ms
+                       # a fork, so hold the reading and re-read on wall-clock.
+
+
+class BatteryCache:
+    """Last ioreg_battery() result, re-read only every `period` seconds.
+
+    Also reports the reading's age, so a log line can say how old its battery
+    figure is instead of silently implying it is as fresh as the watt rails.
+    """
+
+    def __init__(self, read=None, clock=time.monotonic, period=BATTERY_POLL_S):
+        self._read = read or ioreg_battery
+        self._clock, self._period = clock, period
+        self._val, self._at = None, 0.0
+
+    def get(self):
+        """(battery sample, age in seconds since it was actually read)."""
+        now = self._clock()
+        if self._val is None or now - self._at >= self._period:
+            self._val, self._at = self._read(), now
+        return self._val, now - self._at
+
+
 def battery_flow_w(bat):
     # positive = charging. ioreg amperage is signed and matches the true direction.
     return bat.get("amperage_ma", 0.0) * bat.get("voltage_mv", 0.0) / 1e6
 
 
-def read_sample(smc, host=None):
+def read_sample(smc, host=None, bat_cache=None):
     p = smc.read_flt
-    s = ioreg_battery()
+    if bat_cache:                 # shallow copy: read_sample only adds top-level
+        held, age = bat_cache.get()   # keys, so the cached nested dicts are safe
+        s = dict(held)
+        s["battery_age_s"] = round(age, 2)
+    else:
+        s = ioreg_battery()
     connected = s["adapter"]["connected"]
     s["sys_power_w"] = p("PSTR")                       # the pull
     s["adapter_power_w"] = p("PDTR") if connected else 0.0  # delivering
@@ -588,6 +619,7 @@ def watch(seconds, interval_ms, log_path=None):
         sys.exit(f"pdraw: cannot read power — {e}")
     logf = open(log_path, "a") if log_path else None  # JSONL, one sample per line
     host = host_or_none()
+    bat_cache = BatteryCache()   # the gauge moves every ~35s; don't fork ioreg per tick
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
     _blanks = _rows.count(None)
@@ -605,7 +637,7 @@ def watch(seconds, interval_ms, log_path=None):
         sys.stdout.flush()
     try:
         while True:
-            s = read_sample(smc, host)
+            s = read_sample(smc, host, bat_cache)
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
@@ -764,6 +796,24 @@ def selftest():
     assert "rated 140W" in cap and "batt 68%" in cap, cap
     assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
     assert group_caption("gpu", rich) is None      # nothing group-scoped to show
+
+    # battery is re-read on wall-clock, not per tick: the gauge moves every ~35s
+    # (measured), so per-tick polling re-forked ioreg ~70x per real change
+    calls, clock = [], [100.0]
+    cache = BatteryCache(read=lambda: (calls.append(1), {"battery": {"percent": 50}})[1],
+                         clock=lambda: clock[0], period=2.0)
+    first, age = cache.get()
+    assert len(calls) == 1 and age == 0.0, (calls, age)
+    assert first["battery"]["percent"] == 50, first
+    clock[0] = 101.0
+    held, age = cache.get()
+    assert len(calls) == 1, "inside the window must reuse the held reading"
+    assert held is first, "must hand back the held object, not re-read"
+    assert age == 1.0, age                      # and report how stale it is
+    clock[0] = 103.0
+    fresh, age = cache.get()
+    assert len(calls) == 2, "outside the window must re-read"
+    assert fresh is not first and age == 0.0, (fresh, age)
 
     # snapshot: gpu/cpu rows must use THEIR OWN denominators, never the watt scale.
     # 40% of a 28-cell bar is 11 blocks; on the 140 W ledger scale it would be 8.

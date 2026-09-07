@@ -70,6 +70,11 @@ net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
 - GPU figures come from `ioreg IOAccelerator`; CPU and RAM from mach
   `host_statistics` over ctypes — no subprocess, no per-process attribution
   (macOS does not expose per-process GPU on Apple Silicon).
+- The battery gauge only refreshes every ~35 s, so pdraw re-reads it every 2 s
+  and holds the value between reads. Log lines carry `battery_age_s`, the age of
+  that reading. Note `Amperage` is a time-average over the gauge's window while
+  the watt rails are instantaneous, so the two will not balance under varying
+  load — that is the hardware, not a bug.
 - `pdraw top` runs [mactop](https://github.com/metaspartan/mactop) if you have it
   (`brew install mactop`); everything else is self-contained.
 
