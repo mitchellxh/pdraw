@@ -28,12 +28,15 @@ import ctypes.util
 import json
 import os
 import plistlib
+import select
 import shutil
 import signal
 import struct
 import subprocess
 import sys
+import termios
 import time
+import tty
 from collections import deque
 from xml.parsers.expat import ExpatError
 
@@ -274,6 +277,74 @@ class PlistFrames:
             self.dropped += 1   # narrow: a bug in our own code still surfaces
 
 
+# ── keyboard: navigation for the procs view ─────────────────────────────────────
+# Arrow keys arrive as ESC [ A/B, and one read can carry several keypresses, so
+# the buffer is consumed as a sequence rather than a single character.
+_KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
+         " ": "pgdn", "b": "pgup"}
+_ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
+
+
+def parse_keys(buf):
+    """Actions for a raw key buffer; unknown keys are ignored, never fatal."""
+    out, i = [], 0
+    while i < len(buf):
+        if buf[i] == "\x1b" and buf[i + 1:i + 2] == "[":
+            out.append(_ARROWS.get(buf[i + 2:i + 3]))
+            i += 3
+            continue
+        out.append(_KEYS.get(buf[i]))
+        i += 1
+    return [a for a in out if a]
+
+
+def scroll_clamp(off, action, rows, view):
+    """New scroll offset, clamped so the view never runs off either end."""
+    top = max(0, rows - view)
+    step = {"down": 1, "up": -1, "pgdn": view, "pgup": -view}.get(action)
+    if step is not None:
+        off += step
+    elif action == "top":
+        off = 0
+    elif action == "bottom":
+        off = top
+    return max(0, min(off, top))
+
+
+class KeyReader:
+    """Non-blocking single-key reads from the tty, restoring termios on exit."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+
+    def pending(self):
+        """Everything typed since the last call, as one string (often empty)."""
+        buf = ""
+        while select.select([self.fd], [], [], 0)[0]:
+            chunk = os.read(self.fd, 64)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+        return buf
+
+    def restore(self):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+
+def sudo_prime():
+    """Prompt for the password once on the real tty, then confirm it cached.
+
+    Without this the streaming child needs an inherited stderr so sudo can
+    prompt -- which also lets powermetrics' own `proc_pidpath ... failed`
+    warnings onto the screen and into the alt-screen buffer.
+    """
+    subprocess.run(["sudo", "-v"])          # inherits the tty; prompts if needed
+    return subprocess.run(["sudo", "-n", "true"],
+                          capture_output=True).returncode == 0
+
+
 class PowerMetrics:
     """Long-lived `sudo powermetrics` stream — one child, no per-tick fork.
 
@@ -285,14 +356,17 @@ class PowerMetrics:
     ARGS = ("--samplers", "tasks", "--show-process-energy",
             "-f", "plist", "-b", "1", "-n", "-1")
 
-    def __init__(self, interval_ms=1000, stream=None):
+    def __init__(self, interval_ms=1000, stream=None, quiet=True):
         self._frames, self.latest, self.proc = PlistFrames(), None, None
         if stream is not None:          # injected by tests; no child, no sudo
             self._fd = stream
             return
         self.proc = subprocess.Popen(
             ["sudo", "powermetrics", *self.ARGS, "-i", str(interval_ms)],
-            stdout=subprocess.PIPE)     # stderr/stdin inherited: sudo needs the tty
+            stdout=subprocess.PIPE,
+            # quiet only once the credential is cached, else a prompt would be
+            # invisible; powermetrics chatters on stderr the whole run otherwise
+            stderr=subprocess.DEVNULL if quiet else None)
         self._fd = self.proc.stdout
         os.set_blocking(self._fd.fileno(), False)   # never stall the render loop
 
@@ -336,11 +410,11 @@ def _mem_cell(mb):
 def proc_table(rows, name_w=26):
     """Energy-ranked process table: header, rule, one line per process."""
     head = (f"     {'PID':>7}  {'PROCESS':<{name_w}}{'CPU ms/s':>10}"
-            f"{'ENERGY':>9}{'MEM':>8}")
+            f"{'ENERGY/s':>10}{'MEM':>8}")
     out = [head, "     " + "─" * (len(head) - 5)]
     for r in rows:
         out.append(f"     {r['pid']:>7}  {r['name'][:name_w]:<{name_w}}"
-                   f"{r['cpu_ms_s']:>10.1f}{r['energy']:>9.1f}"
+                   f"{r['cpu_ms_s']:>10.1f}{r['energy']:>10.1f}"
                    f"{_mem_cell(r['rss_mb']):>8}")
     return out
 
@@ -366,7 +440,7 @@ def rank_tasks(frame, limit=12, rss=None):
                      "energy": t.get("energy_impact_per_s", t.get("energy_impact", 0.0)),
                      "rss_mb": rss(pid)})
     rows.sort(key=lambda r: -r["energy"])
-    return rows[:limit]
+    return rows[:limit] if limit else rows
 
 
 # ── per-process memory: proc_pidinfo over ctypes ────────────────────────────────
@@ -871,22 +945,29 @@ def watch(seconds, interval_ms, log_path=None):
 
 
 # ── procs: per-process view (opt-in, the only path that uses sudo) ──────────────
-def procs_lines(pm_frame, gpu, s, limit=12):
-    """Header of global state, then the energy-ranked table."""
+def procs_lines(pm_frame, gpu, s, view=12, off=0):
+    """Header of global state, then a scrollable window into the ranked table."""
     bits = []
     if gpu:
         bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gpu['mem_inuse_gb']:.1f} GB"]
     bits.append(f"{s['sys_power_w']:.0f} W draw")
-    head = [""] + [f"  {c('32', '●')}  " + " · ".join(bits), ""]
+    head = ["", f"  {c('32', '●')}  " + " · ".join(bits), ""]
     if not pm_frame:
         return head + ["     waiting for the first powermetrics sample…"]
-    return head + proc_table(rank_tasks(pm_frame, limit=limit))
+    rows = rank_tasks(pm_frame, limit=None)
+    window = rows[off:off + view]
+    shown = f"{off + 1}-{off + len(window)} of {len(rows)}" if window else "none"
+    nav = " · ↑↓/jk scroll · g/G ends · q quit" if len(rows) > view else " · q quit"
+    return head + proc_table(window) + ["     " + c("90", shown + nav)]
 
 
 def procs(seconds, interval_ms):
-    """Live per-process view. No per-process GPU exists on Apple Silicon, so the
-    ranking is by energy — the only positive signal that moves when work leaves
-    the CPU. See README for why CPU% cannot answer that question."""
+    """Live per-process view, ranked by energy.
+
+    No per-process GPU exists on Apple Silicon, so energy is the ranking: low
+    CPU is the *absence* of a signal and cannot separate an idle daemon from a
+    job that handed its work to the GPU.
+    """
     if not shutil.which("powermetrics"):
         sys.exit("pdraw: powermetrics not found (it ships with macOS)")
     try:
@@ -894,14 +975,16 @@ def procs(seconds, interval_ms):
     except OSError as e:
         sys.exit(f"pdraw: cannot read power — {e}")
     interval_ms = max(interval_ms, 1000)   # powermetrics is costly; don't hammer it
-    host = host_or_none()
-    bat_cache = BatteryCache()
-    # Spawn BEFORE the alt-screen: sudo prompts on the normal screen, and a
-    # password prompt painted into an alternate buffer is invisible.
+    host, bat_cache = host_or_none(), BatteryCache()
+    # Prime sudo BEFORE the alt-screen: the prompt must land on the real screen,
+    # and caching the credential lets the child's noisy stderr be silenced.
     print("pdraw: per-process energy needs powermetrics as root; sudo may prompt.")
-    pm = PowerMetrics(interval_ms)
-    deadline = time.monotonic() + 60
-    while pm.poll() is None and time.monotonic() < deadline:
+    cached = sudo_prime()
+    if not cached:
+        print("pdraw: sudo credential not cached — powermetrics warnings will show.")
+    pm = PowerMetrics(interval_ms, quiet=cached)
+    give_up = time.monotonic() + 60
+    while pm.poll() is None and time.monotonic() < give_up:
         if pm.proc and pm.proc.poll() is not None:
             sys.exit("pdraw: powermetrics exited (sudo declined?)")
         time.sleep(0.2)
@@ -909,29 +992,58 @@ def procs(seconds, interval_ms):
     def _on_term(*_):
         raise KeyboardInterrupt
 
-    start, frame = time.monotonic(), []
-    if TTY:
-        signal.signal(signal.SIGTERM, _on_term)
-        sys.stdout.write("\x1b[?1049h\x1b[?25l")
-        sys.stdout.flush()
+    keys = None
+    off, start, frame, done = 0, time.monotonic(), [], False
+
+    def view_rows():
+        return max(3, shutil.get_terminal_size().lines - 10)
+
+    def render(pm_frame, sample):
+        out = procs_lines(pm_frame, sample.get("gpu"), sample, view_rows(), off)
+        note = (f"     energy ranks · no per-process GPU on Apple Silicon · "
+                f"{time.strftime('%H:%M:%S')}")
+        out += ["", c("90", note)]
+        if TTY:
+            sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in out) + "\x1b[J")
+            sys.stdout.flush()
+        return out
+
     try:
-        while True:
+        if TTY:
+            signal.signal(signal.SIGTERM, _on_term)
+            # cbreak inside the try: an exception before it would otherwise
+            # strand the terminal with no echo and no line editing
+            if sys.stdin.isatty():
+                keys = KeyReader()
+            sys.stdout.write("\x1b[?1049h\x1b[?25l")
+            sys.stdout.flush()
+        while not done:
             tick = time.monotonic()
-            s = read_sample(smc, host, bat_cache)
-            rows = max(6, shutil.get_terminal_size().lines - 8)
-            frame = procs_lines(pm.poll(), s.get("gpu"), s, limit=rows)
-            note = ("     no per-process GPU on Apple Silicon · energy ranks · "
-                    f"{time.strftime('%H:%M:%S')}")
-            frame += ["", note]
-            if TTY:
-                sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
-                sys.stdout.flush()
-            if seconds and time.monotonic() - start >= seconds:
-                break
-            sleep_remainder(tick, interval_ms)
+            sample = read_sample(smc, host, bat_cache)
+            pm_frame = pm.poll()
+            frame = render(pm_frame, sample)
+            total = len(rank_tasks(pm_frame, limit=None)) if pm_frame else 0
+            # poll keys far faster than we sample: powermetrics runs at >=1s, but
+            # navigation that lagged a whole second would feel broken
+            while time.monotonic() - tick < interval_ms / 1000:
+                if keys:
+                    acts = parse_keys(keys.pending())
+                    if "quit" in acts:
+                        done = True
+                        break
+                    if acts:
+                        for a in acts:
+                            off = scroll_clamp(off, a, total, view_rows())
+                        frame = render(pm_frame, sample)
+                if seconds and time.monotonic() - start >= seconds:
+                    done = True
+                    break
+                time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
+        if keys:
+            keys.restore()      # never leave the terminal in cbreak mode
         if TTY:
             sys.stdout.write("\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
@@ -1122,6 +1234,26 @@ def selftest():
         slow.get()
         ticks[0] += 2.0
     assert len(reads) < 4, f"default poll inert at a 2s tick: {len(reads)}/4 re-reads"
+
+    # key parsing: arrows arrive as ESC [ A/B, and several keys can land in one
+    # read, so the buffer must be consumed as a sequence not a single char
+    assert parse_keys("j") == ["down"]
+    assert parse_keys("kkj") == ["up", "up", "down"]
+    assert parse_keys("\x1b[B") == ["down"], parse_keys("\x1b[B")
+    assert parse_keys("\x1b[A") == ["up"]
+    assert parse_keys("q") == ["quit"]
+    assert parse_keys("gG") == ["top", "bottom"]
+    assert parse_keys("j\x1b[Ak") == ["down", "up", "up"], parse_keys("j\x1b[Ak")
+    assert parse_keys("zx") == [], "unknown keys are ignored, not crashes"
+    assert parse_keys("") == []
+
+    # scrolling clamps: never past the end, never before the start
+    assert scroll_clamp(0, "up", rows=100, view=10) == 0
+    assert scroll_clamp(0, "down", rows=100, view=10) == 1
+    assert scroll_clamp(90, "down", rows=100, view=10) == 90, "cannot scroll past end"
+    assert scroll_clamp(50, "top", rows=100, view=10) == 0
+    assert scroll_clamp(0, "bottom", rows=100, view=10) == 90
+    assert scroll_clamp(0, "bottom", rows=5, view=10) == 0, "list shorter than view"
 
     # stream driver: newest frame wins, and a tick with no new data keeps the
     # previous one rather than blanking the table
