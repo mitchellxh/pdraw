@@ -544,6 +544,34 @@ def _task_info(pid):
     return info if ok == size else None
 
 
+class _MachTimebase(ctypes.Structure):
+    _fields_ = [("numer", _U32), ("denom", _U32)]
+
+
+def _mach_timebase():
+    """(numer, denom) for mach ticks -> nanoseconds. 125/3 on Apple Silicon."""
+    tb = _MachTimebase()
+    try:
+        _LIBPROC.mach_timebase_info(ctypes.byref(tb))
+    except Exception:
+        return (1, 1)
+    return (tb.numer or 1, tb.denom or 1)
+
+
+TIMEBASE = _mach_timebase()
+
+
+def _ticks_to_ms(ticks, numer, denom):
+    """Mach absolute time units -> milliseconds.
+
+    proc_pidinfo reports CPU time in mach ticks, NOT nanoseconds. On Apple
+    Silicon a tick is 125/3 ns, so dividing by 1e6 as if it were nanoseconds
+    under-reports CPU by ~42x -- a process pinning one core reads 24 ms/s
+    instead of 1000.
+    """
+    return ticks * numer / denom / 1e6
+
+
 class Processes:
     """Per-process CPU and memory with NO sudo, via libproc.
 
@@ -565,13 +593,14 @@ class Processes:
             info = _task_info(pid)
             if info is None:
                 continue
-            cpu_ns = info.pti_total_user + info.pti_total_system
-            cur[pid] = cpu_ns
+            ticks = info.pti_total_user + info.pti_total_system
+            cur[pid] = ticks
             was = self._prev.get(pid)
             rows.append({
                 "pid": pid,
                 "name": proc_name(pid) or "?",
-                "cpu_ms_s": ((cpu_ns - was) / 1e6) / dt if was is not None else 0.0,
+                "cpu_ms_s": (_ticks_to_ms(ticks - was, *TIMEBASE) / dt
+                             if was is not None else 0.0),
                 "rss_mb": info.pti_resident_size / 2**20,
                 "energy": None,          # only powermetrics-as-root can fill this
             })
@@ -1297,6 +1326,15 @@ def selftest():
     assert "rated 140W" in cap and "batt 68%" in cap, cap
     assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
     assert group_caption("gpu", rich) is None      # nothing group-scoped to show
+
+    # proc_pidinfo CPU times are MACH ABSOLUTE TICKS, not nanoseconds. On Apple
+    # Silicon the timebase is 125/3, so a tick is ~41.7ns and treating them as ns
+    # under-reports by 42x -- measured: a process pinning one core read 24.0 ms/s
+    # when the true answer is 1000 (1000 ms/s == 100% of one core).
+    assert abs(_ticks_to_ms(24_000_000, 125, 3) - 1000.0) < 1.0
+    assert _ticks_to_ms(1_000_000, 1, 1) == 1.0          # a 1:1 timebase is ns
+    assert _ticks_to_ms(0, 125, 3) == 0.0
+    assert TIMEBASE[1] > 0, TIMEBASE                     # denom must never be 0
 
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
