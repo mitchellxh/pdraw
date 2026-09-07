@@ -442,9 +442,14 @@ def next_sort(key, reverse, action):
     return (want, not reverse) if want == key else (want, True)
 
 
+# 256-colour ramp, cool grey through to hot red.
+_RAMP = (238, 242, 246, 250, 254, 227, 221, 215, 209, 203)
+
+
 def _heat(frac):
-    """Dim -> plain -> warm -> hot as a value approaches the top of the screen."""
-    return "90" if frac < 0.15 else "37" if frac < 0.40 else "33" if frac < 0.70 else "31"
+    """Colour for a position in 0..1 along the cool-to-hot ramp."""
+    f = max(0.0, min(1.0, frac))
+    return f"38;5;{_RAMP[min(int(f * len(_RAMP)), len(_RAMP) - 1)]}"
 
 
 def sort_rows(rows, key="energy", reverse=True):
@@ -459,10 +464,7 @@ def sort_rows(rows, key="energy", reverse=True):
     return known + unknown
 
 
-_BARW = 14
-
-
-def proc_table(rows, sort_key="energy", reverse=True, name_w=26, show_energy=True):
+def proc_table(rows, sort_key="energy", reverse=True, name_w=34, show_energy=True):
     """Process table. The active sort column is marked so the view says how it
     is ordered rather than leaving the reader to guess."""
     cols = [col for col in _COLS if col[2] != "energy" or show_energy]
@@ -470,23 +472,24 @@ def proc_table(rows, sort_key="energy", reverse=True, name_w=26, show_energy=Tru
     widths = [w or name_w for _, w, _, _ in cols]
     heads = [lbl + (mark if key == sort_key else "") for lbl, _, key, _ in cols]
     head = (f"     {heads[0]:>{widths[0]}}  {heads[1]:<{widths[1]}}"
-            + "".join(f"{h:>{w}}" for h, w in zip(heads[2:], widths[2:]))
-            + f"  {'SHARE':<{_BARW}}")
+            + "".join(f"{h:>{w}}" for h, w in zip(heads[2:], widths[2:])))
     out = [c("90", head), "     " + c("90", "─" * (len(head) - 5))]
-    # the bar tracks whichever column is sorted, scaled to the largest value on
-    # screen -- the same "share of the visible maximum" idea as the snapshot bars
-    vals = [r.get(sort_key) for r in rows if isinstance(r.get(sort_key), (int, float))]
-    top = max(vals) if vals else 0
-    for r in rows:
+    # Colour by RANK among the visible rows, not by share of the maximum. Process
+    # load is skewed enough that one busy process pins the scale and flattens
+    # everyone else into a single shade; rank always gradates. The numbers carry
+    # magnitude -- colour is a visual index for ordering the eye.
+    order = sorted(range(len(rows)),
+                   key=lambda i: (rows[i].get(sort_key) is not None,
+                                  rows[i].get(sort_key) or 0))
+    rank = {i: pos for pos, i in enumerate(order)}
+    span = max(len(rows) - 1, 1)
+    for i, r in enumerate(rows):
         tail = "".join(f"{('—' if r.get(k) is None else fmt(r[k])):>{w}}"
                        for (_, _, k, fmt), w in zip(cols[2:], widths[2:]))
-        v = r.get(sort_key)
-        frac = (v / top) if top and isinstance(v, (int, float)) else 0.0
-        bar = _bar(frac, _heat(frac), _BARW) if frac >= 0.08 else " " * _BARW
+        shade = _heat(rank[i] / span)
         pid_cell = f"{r['pid']:>{widths[0]}}"
         out.append(f"     {c('90', pid_cell)}  "
-                   f"{r['name'][:name_w]:<{widths[1]}}"
-                   + c(_heat(frac), tail) + "  " + bar)
+                   + c(shade, f"{r['name'][:name_w]:<{widths[1]}}" + tail))
     return out
 
 
@@ -1093,22 +1096,27 @@ def procs(seconds, interval_ms, want_energy=False):
         sys.exit(f"pdraw: cannot read power — {e}")
     host, bat_cache, source = host_or_none(), BatteryCache(), Processes()
     pm, quiet = None, True
-    if want_energy:
-        if not shutil.which("powermetrics"):
-            sys.exit("pdraw: powermetrics not found (it ships with macOS)")
+    have_pm = bool(shutil.which("powermetrics"))
+    if want_energy and not have_pm:
+        sys.exit("pdraw: powermetrics not found (it ships with macOS)")
+    # Free upgrade: if sudo needs no password right now (cached credential or a
+    # NOPASSWD rule), show IMPACT without being asked. Only an actual prompt is
+    # worth making someone opt in to.
+    if have_pm and (want_energy or sudo_passwordless(PowerMetrics.argv())):
         # Prime sudo BEFORE the alt-screen: the prompt must land on the real
         # screen, and caching lets the child's noisy stderr be silenced.
         quiet = sudo_prime(PowerMetrics.argv())
         if not quiet:
             print("pdraw: sudo not cached — powermetrics warnings will show.")
         pm = PowerMetrics(quiet=quiet)
+    show_energy = pm is not None
 
     def _on_term(*_):
         raise KeyboardInterrupt
 
     keys = None
     off, start, frame, done = 0, time.monotonic(), [], False
-    sort_key, reverse = ("energy" if want_energy else "cpu_ms_s"), True
+    sort_key, reverse = ("energy" if show_energy else "cpu_ms_s"), True
     source.sample()          # CPU is a delta; discard the baseline sample
 
     def view_rows():
@@ -1116,9 +1124,11 @@ def procs(seconds, interval_ms, want_energy=False):
 
     def render(rows, sample):
         out = procs_lines(rows, sample.get("gpu"), sample, view_rows(), off,
-                          sort_key, reverse, show_energy=want_energy)
-        note = (f"     {'IMPACT is a unitless score, not watts · ' if want_energy else ''}"
-                f"no per-process GPU on Apple Silicon · {time.strftime('%H:%M:%S')}")
+                          sort_key, reverse, show_energy=show_energy)
+        hint = ("IMPACT is a relative score, not watts · " if show_energy
+                else "IMPACT (energy) needs --energy · ")
+        note = (f"     {hint}no per-process GPU on Apple Silicon · "
+                f"{time.strftime('%H:%M:%S')}")
         out += ["", c("90", note)]
         if TTY:
             sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in out) + "\x1b[J")
@@ -1154,7 +1164,7 @@ def procs(seconds, interval_ms, want_energy=False):
                             if a == "reverse":
                                 reverse = not reverse
                             elif a in SORT_KEYS:
-                                if SORT_KEYS[a] == "energy" and not want_energy:
+                                if SORT_KEYS[a] == "energy" and not show_energy:
                                     continue          # column isn't shown
                                 sort_key, reverse = next_sort(sort_key, reverse, a)
                                 off = 0               # new ordering starts at its top
@@ -1297,7 +1307,9 @@ def selftest():
     assert all({"pid", "name", "cpu_ms_s", "rss_mb"} <= set(r) for r in live_rows)
     assert any(r["pid"] == os.getpid() for r in live_rows), "our own process must appear"
     assert all(r["energy"] is None for r in live_rows), "no energy without powermetrics"
-    assert all(r["rss_mb"] > 0 for r in live_rows), "we only list what we can read"
+    # the invariant is readability, not non-emptiness: a zombie or exiting
+    # process legitimately has zero resident pages
+    assert all(r["rss_mb"] is not None for r in live_rows), "we list only what we read"
 
     # energy merges in by pid when powermetrics IS available
     merged = merge_energy([{"pid": 11, "energy": None}, {"pid": 99, "energy": None}],
@@ -1346,11 +1358,21 @@ def selftest():
     assert next_sort("cpu_ms_s", False, "sort_cpu") == ("cpu_ms_s", True)
     assert next_sort("cpu_ms_s", False, "sort_mem") == ("rss_mb", True)
 
-    # a bar on the sorted column, scaled to the largest value on screen, so the
-    # table carries the same visual grammar as pdraw's snapshot ledger
-    barred = proc_table(trows, sort_key="cpu_ms_s")
-    assert "█" in next(l for l in barred if "python3.12" in l), barred
-    assert "█" not in next(l for l in barred if "distnoted" in l), "tiny value, no bar"
+    # colour must separate the long tail. Process load is heavily skewed -- with
+    # ~375 processes almost everything sits under 15% of the max -- so a linear
+    # 4-step ramp dumped the entire tail into one indistinguishable bucket.
+    shades = {_heat(f) for f in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)}
+    assert len(shades) == 6, shades
+    assert "SHARE" not in next(l for l in proc_table(trows) if "PID" in l)
+    # colour follows rank by VALUE, not screen position, so the largest value is
+    # hottest even when the table is sorted ascending
+    import re as _re
+    def _shades(tbl):
+        return [(_re.findall(r"38;5;(\d+)", l) or ["-"])[0] for l in tbl[2:]]
+    desc = proc_table(sort_rows(trows, "cpu_ms_s"), sort_key="cpu_ms_s")
+    asc = proc_table(sort_rows(trows, "cpu_ms_s", reverse=False),
+                     sort_key="cpu_ms_s", reverse=False)
+    assert _shades(desc) == list(reversed(_shades(asc))), (_shades(desc), _shades(asc))
 
     # sort keys reach parse_keys
     assert parse_keys("c") == ["sort_cpu"]
