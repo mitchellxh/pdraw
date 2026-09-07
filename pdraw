@@ -35,6 +35,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from xml.parsers.expat import ExpatError
 
 COLORS = {"draw": "33", "charger": "36", "compute": "35",   # yellow / cyan / magenta
           "gpu": "32", "gpu_mem": "32", "cpu": "34", "ram": "34"}  # green / blue
@@ -233,6 +234,108 @@ def cpu_pct_from_ticks(prev, cur):
     d = [b - a for a, b in zip(prev, cur)]
     total = sum(d)
     return 100.0 * (d[0] + d[1] + d[3]) / total if total > 0 else 0.0  # +nice
+
+
+# ── powermetrics stream: NUL-framed plists ──────────────────────────────────────
+class PlistFrames:
+    """Reassembles a `powermetrics --format plist` byte stream into whole plists.
+
+    Frames are NUL-separated, and a read from a pipe lands wherever it lands, so
+    a frame split mid-XML is routine. Partial tails are held until terminated.
+    """
+
+    def __init__(self):
+        self._buf = b""
+        self.dropped = 0        # corrupt frames seen; surfaced rather than hidden
+
+    def feed(self, chunk):
+        """Parsed dicts for every frame this chunk completed (possibly none)."""
+        self._buf += chunk
+        out = []
+        while b"\x00" in self._buf:
+            raw, self._buf = self._buf.split(b"\x00", 1)
+            if not raw.strip():
+                continue
+            try:
+                out.append(plistlib.loads(raw))
+            except (plistlib.InvalidFileException, ExpatError):
+                self.dropped += 1   # narrow: a bug in our own code still surfaces
+        return out
+
+
+def _mem_cell(mb):
+    """Memory as a fixed-width cell. None -> em dash: we could not read it, which
+    is not the same as zero, and a 0 would quietly libel an innocent process."""
+    if mb is None:
+        return "—"
+    return f"{mb / 1024:.1f}G" if mb >= 1024 else f"{mb:.0f}M"
+
+
+def proc_table(rows, name_w=26):
+    """Energy-ranked process table: header, rule, one line per process."""
+    head = (f"     {'PID':>7}  {'PROCESS':<{name_w}}{'CPU ms/s':>10}"
+            f"{'ENERGY':>9}{'MEM':>8}")
+    out = [head, "     " + "─" * (len(head) - 5)]
+    for r in rows:
+        out.append(f"     {r['pid']:>7}  {r['name'][:name_w]:<{name_w}}"
+                   f"{r['cpu_ms_s']:>10.1f}{r['energy']:>9.1f}"
+                   f"{_mem_cell(r['rss_mb']):>8}")
+    return out
+
+
+def rank_tasks(frame, limit=12, rss=None):
+    """Top tasks from one powermetrics frame, ranked by energy impact.
+
+    Energy, not CPU: low CPU is the *absence* of a signal, so it cannot tell an
+    idle daemon from a job that has handed its work to the GPU. Energy rises for
+    either path, which is the only positive signal macOS gives us here.
+
+    Rows with a negative pid are powermetrics' synthetic aggregates
+    (DEAD_TASKS, ALL_TASKS) and are not processes.
+    """
+    rss = rss or proc_rss_mb
+    rows = []
+    for t in frame.get("tasks") or []:
+        pid = t.get("pid", -1)
+        if pid < 0:
+            continue
+        rows.append({"pid": pid, "name": t.get("name", "?"),
+                     "cpu_ms_s": t.get("cputime_ms_per_s", 0.0),
+                     "energy": t.get("energy_impact_per_s", t.get("energy_impact", 0.0)),
+                     "rss_mb": rss(pid)})
+    rows.sort(key=lambda r: -r["energy"])
+    return rows[:limit]
+
+
+# ── per-process memory: proc_pidinfo over ctypes ────────────────────────────────
+# Unlike task_for_pid (denied even for same-user processes), proc_pidinfo reads
+# any process we own: measured 200/200 of this user's, 0/200 of other users'.
+# 0.0015 ms a call, so no fork and no cache needed.
+_PROC_PIDTASKINFO = 4
+
+
+class _ProcTaskInfo(ctypes.Structure):
+    _fields_ = ([("pti_virtual_size", _U64), ("pti_resident_size", _U64),
+                 ("pti_total_user", _U64), ("pti_total_system", _U64),
+                 ("pti_threads_user", _U64), ("pti_threads_system", _U64)] +
+                [(n, ctypes.c_int32) for n in
+                 ("policy", "faults", "pageins", "cow_faults", "messages_sent",
+                  "messages_received", "syscalls_mach", "syscalls_unix", "csw",
+                  "threadnum", "numrunning", "priority")])
+
+
+_LIBPROC = ctypes.CDLL(ctypes.util.find_library("c"))
+_LIBPROC.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, _U64,
+                                  ctypes.c_void_p, ctypes.c_int]
+
+
+def proc_rss_mb(pid):
+    """Resident memory in MB, or None when the process isn't ours to read."""
+    info = _ProcTaskInfo()
+    size = ctypes.sizeof(_ProcTaskInfo)
+    if _LIBPROC.proc_pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(info), size) != size:
+        return None                      # unreadable -> caller shows "—", never 0
+    return info.pti_resident_size / 2**20
 
 
 def host_or_none():
@@ -796,6 +899,58 @@ def selftest():
     assert "rated 140W" in cap and "batt 68%" in cap, cap
     assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
     assert group_caption("gpu", rich) is None      # nothing group-scoped to show
+
+    # process table: unreadable memory renders as a dash, never a misleading 0
+    trows = [{"pid": 11, "name": "python3.12", "cpu_ms_s": 142.3, "energy": 88.4,
+              "rss_mb": 8600.0},
+             {"pid": 1258, "name": "WindowServer", "cpu_ms_s": 9.9, "energy": 3.1,
+              "rss_mb": None},
+             {"pid": 987, "name": "distnoted", "cpu_ms_s": 0.4, "energy": 0.1,
+              "rss_mb": 1.5}]
+    tbl = proc_table(trows)
+    assert any("PID" in l and "ENERGY" in l and "MEM" in l for l in tbl), tbl
+    assert "8.4G" in next(l for l in tbl if "python3.12" in l)      # MB rendered as GB
+    assert "2M" in next(l for l in tbl if "distnoted" in l)         # small stays MB
+    assert "—" in next(l for l in tbl if "WindowServer" in l)       # unknown, not 0
+    hdr = next(l for l in tbl if "PID" in l)
+    assert all(len(l) == len(hdr) for l in tbl if l.strip() and "─" not in l), \
+        [len(l) for l in tbl]                                     # columns aligned
+
+    # tasks ranked by energy (CPU% cannot discriminate: an idle audio daemon and a
+    # GPU-bound job both show low CPU). Synthetic aggregate rows must be dropped --
+    # real output carries DEAD_TASKS (pid -1) and ALL_TASKS (pid -2).
+    frame = {"tasks": [
+        {"pid": 10, "name": "quiet", "cputime_ms_per_s": 5.0, "energy_impact_per_s": 1.0},
+        {"pid": 11, "name": "busy", "cputime_ms_per_s": 2.0, "energy_impact_per_s": 90.0},
+        {"pid": -1, "name": "DEAD_TASKS", "cputime_ms_per_s": 30.0, "energy_impact_per_s": 5.0},
+        {"pid": -2, "name": "ALL_TASKS", "cputime_ms_per_s": 99.0, "energy_impact_per_s": 99.0},
+    ]}
+    ranked = rank_tasks(frame, limit=5, rss=lambda pid: 4.0 if pid == 11 else None)
+    assert [r["pid"] for r in ranked] == [11, 10], ranked   # energy order, not CPU
+    assert ranked[0]["rss_mb"] == 4.0 and ranked[1]["rss_mb"] is None, ranked
+    assert ranked[0]["name"] == "busy" and ranked[0]["cpu_ms_s"] == 2.0
+    assert len(rank_tasks(frame, limit=1, rss=lambda p: None)) == 1, "limit honoured"
+
+    # powermetrics -f plist emits NUL-separated frames. The reader must yield only
+    # complete frames and hold a partial tail across chunk boundaries -- a frame
+    # split mid-XML is the normal case when reading a pipe, not an edge case.
+    f1 = plistlib.dumps({"tasks": [{"pid": 1, "name": "a"}]})
+    f2 = plistlib.dumps({"tasks": [{"pid": 2, "name": "b"}]})
+    fr = PlistFrames()
+    assert fr.feed(f1[:20]) == [], "partial frame must yield nothing"
+    assert fr.feed(f1[20:] + b"\x00")[0]["tasks"][0]["pid"] == 1
+    both = fr.feed(f2 + b"\x00" + f1 + b"\x00")
+    assert [d["tasks"][0]["pid"] for d in both] == [2, 1], both
+    assert fr.feed(f2[:10]) == []                       # tail held, not lost
+    assert fr.feed(f2[10:] + b"\x00")[0]["tasks"][0]["pid"] == 2
+    assert fr.feed(b"not a plist\x00") == [], "garbage frame skipped, stream survives"
+    assert fr.dropped == 1, fr.dropped   # counted, not silently swallowed
+
+    # per-process RSS via proc_pidinfo: free and fork-less, but readable only for
+    # processes we own. Root-owned daemons must report unknown, never a bogus 0.
+    assert proc_rss_mb(os.getpid()) > 0, proc_rss_mb(os.getpid())
+    assert proc_rss_mb(1) is None, "launchd is root-owned -> unreadable"
+    assert proc_rss_mb(2 ** 30) is None, "nonexistent pid"
 
     # battery is re-read on wall-clock, not per tick: the gauge moves every ~35s
     # (measured), so per-tick polling re-forked ioreg ~70x per real change
