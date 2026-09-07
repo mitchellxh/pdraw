@@ -28,6 +28,7 @@ import ctypes.util
 import json
 import os
 import plistlib
+import re
 import select
 import shutil
 import signal
@@ -282,10 +283,10 @@ class PlistFrames:
 # the buffer is consumed as a sequence rather than a single character.
 _KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
          " ": "pgdn", "b": "pgup", "r": "reverse",
-         "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem",
+         "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem", "u": "sort_gpu",
          "p": "sort_pid", "n": "sort_name"}
-SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_energy": "energy", "sort_mem": "rss_mb",
-             "sort_pid": "pid", "sort_name": "name"}
+SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_energy": "energy",
+             "sort_mem": "rss_mb", "sort_pid": "pid", "sort_name": "name"}
 _ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
 
 
@@ -431,6 +432,7 @@ class PowerMetrics:
 _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("PROCESS", 0, "name", None),                       # 0 = the flex column
          ("CPU%", 8, "cpu_pct", lambda v: f"{v:.1f}"),
+         ("GPU%", 8, "gpu_pct", lambda v: f"{v:.1f}"),
          ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"),
          ("MEM MB", 9, "rss_mb", lambda v: f"{v:.0f}"))
 
@@ -572,6 +574,44 @@ def _ticks_to_ms(ticks, numer, denom):
     return ticks * numer / denom / 1e6
 
 
+_CREATOR = re.compile(r"pid (\d+), (.+)")
+
+
+def _gpu_from_clients(nodes):
+    """pid -> accumulated Metal GPU nanoseconds, summed over its user clients.
+
+    A process can hold several AGXDeviceUserClients, and each carries its own
+    AppUsage list, so both levels are summed. Clients with no parseable creator
+    are unattributable and dropped rather than guessed at.
+    """
+    out = {}
+    for n in nodes:
+        m = _CREATOR.match(n.get("IOUserClientCreator") or "")
+        if not m:
+            continue
+        pid, name = int(m.group(1)), m.group(2)
+        ns = sum(u.get("accumulatedGPUTime", 0) for u in (n.get("AppUsage") or []))
+        prev = out.get(pid)
+        out[pid] = (name, (prev[1] if prev else 0) + ns)
+    return out
+
+
+def gpu_by_pid():
+    """Per-process GPU nanoseconds from ioreg. No sudo. {} if unavailable."""
+    try:
+        out = subprocess.run(["ioreg", "-a", "-r", "-c", "AGXDeviceUserClient"],
+                             capture_output=True, timeout=10).stdout
+        return _gpu_from_clients(plistlib.loads(out) or [])
+    except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException,
+            ExpatError, ValueError):
+        return {}
+
+
+def _gpu_percent(ns, dt):
+    """GPU time as a percentage of wall clock: 100% is the GPU busy throughout."""
+    return ns / 1e7 / dt if dt > 0 else 0.0
+
+
 def _cpu_percent(ticks, dt, timebase=None):
     """CPU as a percentage of ONE core over `dt` seconds.
 
@@ -595,16 +635,24 @@ class Processes:
     """
 
     def __init__(self):
-        self._prev, self._t = {}, time.monotonic()
+        self._prev, self._prev_gpu, self._t = {}, {}, time.monotonic()
 
     def sample(self):
         now = time.monotonic()
         dt = max(now - self._t, 1e-6)
-        cur, rows = {}, []
+        gpu_now = gpu_by_pid()
+        cur, rows, seen = {}, [], set()
+
+        def gpu_pct(pid):
+            was = self._prev_gpu.get(pid)
+            now_ns = gpu_now.get(pid, (None, 0))[1]
+            return _gpu_percent(now_ns - was, dt) if was is not None else 0.0
+
         for pid in list_pids():
             info = _task_info(pid)
             if info is None:
                 continue
+            seen.add(pid)
             ticks = info.pti_total_user + info.pti_total_system
             cur[pid] = ticks
             was = self._prev.get(pid)
@@ -612,10 +660,20 @@ class Processes:
                 "pid": pid,
                 "name": proc_name(pid) or "?",
                 "cpu_pct": _cpu_percent(ticks - was, dt) if was is not None else 0.0,
+                "gpu_pct": gpu_pct(pid),
                 "rss_mb": info.pti_resident_size / 2**20,
                 "energy": None,          # only powermetrics-as-root can fill this
             })
+        # Processes we cannot read but which hold GPU clients -- WindowServer is
+        # the obvious one. Their GPU time is real and worth showing even though
+        # their CPU and memory are not ours to see.
+        for pid, (name, _) in gpu_now.items():
+            if pid in seen:
+                continue
+            rows.append({"pid": pid, "name": name, "cpu_pct": None,
+                         "gpu_pct": gpu_pct(pid), "rss_mb": None, "energy": None})
         self._prev, self._t = cur, now
+        self._prev_gpu = {pid: ns for pid, (_, ns) in gpu_now.items()}
         return rows
 
 
@@ -1354,6 +1412,33 @@ def selftest():
     assert abs(_cpu_percent(24_000_000, 2.0, (125, 3)) - 50.0) < 0.1    # half as busy
     assert _cpu_percent(0, 1.0, (125, 3)) == 0.0
 
+    # Per-process GPU DOES exist on Apple Silicon. AGXDeviceUserClient nodes carry
+    # the owning pid and accumulated Metal GPU time, readable with no sudo. It is
+    # absent from the IOAccelerator subtree and from powermetrics, which is why
+    # three earlier probes concluded, wrongly, that it did not exist.
+    nodes = [
+        {"IOUserClientCreator": "pid 42, myapp",
+         "AppUsage": [{"API": "Metal", "accumulatedGPUTime": 1000},
+                      {"API": "Metal", "accumulatedGPUTime": 500}]},
+        {"IOUserClientCreator": "pid 42, myapp",
+         "AppUsage": [{"accumulatedGPUTime": 250}]},          # same pid, 2nd client
+        {"IOUserClientCreator": "pid 7, idle", "AppUsage": []},
+        {"AppUsage": [{"accumulatedGPUTime": 99}]},           # no creator -> skipped
+        {"IOUserClientCreator": "malformed", "AppUsage": []},
+    ]
+    gmap = _gpu_from_clients(nodes)
+    assert gmap[42] == ("myapp", 1750), gmap   # summed over a process's clients
+    assert gmap[7] == ("idle", 0), gmap
+    assert 42 in gmap and 7 in gmap and len(gmap) == 2, gmap
+    # the creator string is the ONLY name we get for root-owned GPU users like
+    # WindowServer, which proc_pidinfo cannot read at all
+    assert gmap[42][0] == "myapp"
+
+    # accumulatedGPUTime is nanoseconds: a full GPU-second in one second is 100%
+    assert abs(_gpu_percent(1_000_000_000, 1.0) - 100.0) < 0.01
+    assert abs(_gpu_percent(500_000_000, 2.0) - 25.0) < 0.01
+    assert _gpu_percent(0, 1.0) == 0.0
+
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
     src = Processes()
@@ -1363,9 +1448,14 @@ def selftest():
     assert all({"pid", "name", "cpu_pct", "rss_mb"} <= set(r) for r in live_rows)
     assert any(r["pid"] == os.getpid() for r in live_rows), "our own process must appear"
     assert all(r["energy"] is None for r in live_rows), "no energy without powermetrics"
-    # the invariant is readability, not non-emptiness: a zombie or exiting
-    # process legitimately has zero resident pages
-    assert all(r["rss_mb"] is not None for r in live_rows), "we list only what we read"
+    # Rows are either fully readable (ours), or GPU-only entries for processes we
+    # cannot read but which hold GPU clients -- WindowServer being the obvious
+    # one. Those show unknown for CPU and memory rather than a fabricated 0.
+    readable = [r for r in live_rows if r["rss_mb"] is not None]
+    gpu_only = [r for r in live_rows if r["rss_mb"] is None]
+    assert readable, "libproc must give us our own processes"
+    assert all(r["cpu_pct"] is None for r in gpu_only), "unreadable CPU stays unknown"
+    assert all(r["gpu_pct"] is not None for r in live_rows), "GPU is known for all"
 
     # energy merges in by pid when powermetrics IS available
     merged = merge_energy([{"pid": 11, "energy": None}, {"pid": 99, "energy": None}],

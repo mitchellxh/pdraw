@@ -24,7 +24,8 @@ pdraw -i 250       # sample interval in ms (default 500)
 pdraw -s           # one-shot snapshot
 pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
-pdraw procs        # per-process energy view (opt-in; uses sudo)
+pdraw procs        # per-process CPU / GPU / memory (no sudo)
+pdraw procs --energy  # ...plus Apple's Energy Impact score (uses sudo)
 pdraw top          # run mactop, if installed
 ```
 
@@ -87,12 +88,18 @@ tell an idle daemon from a job that has handed its work to the GPU. Energy rises
 for either. In the sample above `Moonlight` has 2.5x the CPU of `stable` but a
 third of the energy — sorting by CPU would put the wrong process on top.
 
-**There is no per-process GPU column, because macOS does not expose one on Apple
-Silicon.** Verified three ways: `task_for_pid` is denied even for same-user
-processes; `powermetrics` emits no GPU key in plist under any sampler
-combination; and its text-mode `GPU ms/s` column reads `0.00` for every process
-— including `WindowServer` — while the GPU sits at 36%. Global GPU utilization
-in the header is the closest available answer.
+**Per-process GPU comes from `AGXDeviceUserClient` nodes in the IORegistry**,
+which carry the owning pid and accumulated Metal GPU time in nanoseconds. No
+sudo. It is *not* in the `IOAccelerator` subtree and *not* in `powermetrics`
+(whose `--show-process-gpu` column reads `0.00` for every process on Apple
+Silicon, `WindowServer` included, even at 36% GPU) — so it is easy to look in
+the obvious places and wrongly conclude it does not exist.
+
+`GPU%` is time-on-GPU as a share of wall clock, the same convention as `CPU%`.
+Processes that hold GPU clients but are not ours to read — `WindowServer` above
+all — are still listed, with `—` for CPU and memory. There is still no
+per-process *VRAM*: unified memory means GPU allocations are wired system pages,
+reported globally only.
 
 `MEM` shows `—` for processes you do not own: `proc_pidinfo` reads all 200/200 of
 your own processes but none belonging to other users, and a `0` there would be a
