@@ -526,6 +526,11 @@ PER_ROW = 2          # always 2 wide: keeps charts readable at any terminal size
 COMPACT_H = 2        # one deliberate density step, not a gradual squeeze
 
 
+def _chunk(lanes, per_row=PER_ROW):
+    """Split one group's lanes into panel rows."""
+    return [list(lanes[i:i + per_row]) for i in range(0, len(lanes), per_row)]
+
+
 def grid_rows(groups=GROUPS, per_row=PER_ROW, sep=False):
     """Flatten groups into panel rows, never mixing two groups in one row.
 
@@ -536,8 +541,21 @@ def grid_rows(groups=GROUPS, per_row=PER_ROW, sep=False):
     for _, lanes in groups:
         if sep and rows:
             rows.append(None)
-        rows += [list(lanes[i:i + per_row]) for i in range(0, len(lanes), per_row)]
+        rows += _chunk(lanes, per_row)
     return rows
+
+
+def group_caption(name, s):
+    """Group-scoped state, shown under its own band rather than in the footer.
+
+    The footer carries only what every facet shares (sample count, interval,
+    clock); the PD contract and battery charge describe the energy band alone.
+    """
+    if name != "energy":
+        return None
+    ad, bat = s["adapter"], s["battery"]
+    state = f"rated {ad['watts']}W ┄" if ad["connected"] else "ON BATTERY"
+    return f" {state} · batt {bat['percent']:.0f}%"
 
 
 def lane_panel(lane, vals, width, height, rated, total_gb):
@@ -551,14 +569,15 @@ def lane_panel(lane, vals, width, height, rated, total_gb):
                  ref=ref, height=height)
 
 
-def panel_geom(cols, lines, n_rows, per_row=PER_ROW, separators=0):
+def panel_geom(cols, lines, n_rows, per_row=PER_ROW, extra_lines=1):
     """(chart width, chart height). Width generalizes today's (cols - 2*9)//2.
 
-    `separators` are blank lines between groups; they spend height too, so the
-    compact step has to account for them or it trips at the wrong terminal size.
+    `extra_lines` counts every non-panel line in the frame — group separators,
+    group captions, the footer. They spend height too, so the compact step has
+    to include them or it trips at the wrong terminal size.
     """
     width = max(24, min(80, (cols - 9 * per_row) // per_row))
-    full = n_rows * (PANEL_H + 2) + separators + 1 <= lines
+    full = n_rows * (PANEL_H + 2) + extra_lines <= lines
     return width, (PANEL_H if full else COMPACT_H)
 
 
@@ -571,9 +590,9 @@ def watch(seconds, interval_ms, log_path=None):
     host = host_or_none()
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
-    width, panel_h = panel_geom(term.columns, term.lines,
-                                len(_rows) - _rows.count(None),
-                                separators=_rows.count(None))
+    _blanks = _rows.count(None)
+    width, panel_h = panel_geom(term.columns, term.lines, len(_rows) - _blanks,
+                                extra_lines=_blanks + 2)  # + energy caption + footer
     hist = {k: deque(maxlen=width * 2) for k in LANES}
     start, frame = time.monotonic(), []
 
@@ -590,31 +609,32 @@ def watch(seconds, interval_ms, log_path=None):
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
-            # groups absent from this sample are dropped, never drawn empty
-            rows = grid_rows(active_groups(s), sep=True)
-            n_sep = rows.count(None)
+            groups = active_groups(s)  # absent groups are dropped, never drawn empty
+            caps = {n: group_caption(n, s) for n, _ in groups}
+            n_rows = sum(len(_chunk(lanes)) for _, lanes in groups)
+            extra = (len(groups) - 1) + sum(1 for v in caps.values() if v) + 1
             term = shutil.get_terminal_size()
-            w, panel_h = panel_geom(term.columns, term.lines, len(rows) - n_sep,
-                                    separators=n_sep)
+            w, panel_h = panel_geom(term.columns, term.lines, n_rows,
+                                    extra_lines=extra)
             if w != width:  # terminal resized: re-flow panels, re-cap history to fit
                 width = w   # deque(old, maxlen=n) keeps the most recent n samples
                 hist = {k: deque(hist[k], maxlen=width * 2) for k in LANES}
             for k, v in lane_values(s).items():
                 hist[k].append(v)
-            ad, bat = s["adapter"], s["battery"]
+            ad = s["adapter"]          # battery % moved into the energy caption
             rated = ad["watts"] if ad["connected"] else None
             total_gb = host.total_gb if host else 0.0
             frame = []
-            for row in rows:
-                if row is None:
+            for gi, (name, lanes) in enumerate(groups):
+                if gi:
                     frame.append("")          # blank line divides the groups
-                    continue
-                frame += side_by_side(*(lane_panel(k, hist[k], width, panel_h,
-                                                   rated, total_gb) for k in row))
-            status = f"rated {rated}W ┄" if rated else "ON BATTERY"
-            frame += [f" {status} · batt {bat['percent']:.0f}% · "
-                      f"{len(hist['draw'])} samples @ {interval_ms}ms · "
-                      f"{time.strftime('%H:%M:%S')}"]
+                for row in _chunk(lanes):
+                    frame += side_by_side(*(lane_panel(k, hist[k], width, panel_h,
+                                                       rated, total_gb) for k in row))
+                if caps[name]:                # group-scoped state, under its band
+                    frame.append(caps[name])
+            frame += [f" {len(hist['draw'])} samples @ {interval_ms}ms · "
+                      f"{time.strftime('%H:%M:%S')}"]  # frame-scoped: shared by all
             if TTY:  # redraw from home + clear-to-end: resilient to resize/clear,
                 sys.stdout.write(  # no prev_lines bookkeeping to drift out of sync
                     "\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
@@ -679,9 +699,9 @@ def selftest():
     assert sep_rows.count(None) == 2, sep_rows           # 3 groups -> 2 separators
     assert sep_rows[2] is None and sep_rows[4] is None, sep_rows
     assert [r for r in sep_rows if r] == grid_rows(GROUPS)  # same rows, same order
-    # separators must count against the height budget or compact trips too late
-    assert panel_geom(100, 31, n_rows=4, separators=2)[1] == PANEL_H
-    assert panel_geom(100, 30, n_rows=4, separators=2)[1] == COMPACT_H
+    # every non-panel line spends height: 4 rows + 2 blanks + caption + footer
+    assert panel_geom(100, 32, n_rows=4, extra_lines=4)[1] == PANEL_H
+    assert panel_geom(100, 31, n_rows=4, extra_lines=4)[1] == COMPACT_H
     # today's 2-wide width formula is preserved exactly at 100 cols
     assert panel_geom(100, 40, n_rows=2)[0] == 41, panel_geom(100, 40, n_rows=2)
     assert panel_geom(100, 40, n_rows=4)[1] == PANEL_H     # 4 rows fit 40 lines
@@ -737,6 +757,13 @@ def selftest():
     assert "ram 29.0GB" in mem[0] and "43" in mem[1], (mem[0], mem[1])  # 0-48 fixed
     neg = lane_panel("battery", [-5, -8], width=12, height=PANEL_H, rated=140, total_gb=48)
     assert "battery -8.0W" in neg[0], neg[0]             # signed format kept
+
+    # group-scoped state sits with its band; only frame-scoped state (sample
+    # cadence, clock — shared by every facet) belongs in the global footer
+    cap = group_caption("energy", fake)
+    assert "rated 140W" in cap and "batt 68%" in cap, cap
+    assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
+    assert group_caption("gpu", rich) is None      # nothing group-scoped to show
 
     # snapshot: gpu/cpu rows must use THEIR OWN denominators, never the watt scale.
     # 40% of a 28-cell bar is 11 blocks; on the 140 W ledger scale it would be 8.
