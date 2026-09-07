@@ -36,7 +36,17 @@ import sys
 import time
 from collections import deque
 
-COLORS = {"draw": "33", "charger": "36", "compute": "35"}  # yellow / cyan / magenta
+COLORS = {"draw": "33", "charger": "36", "compute": "35",   # yellow / cyan / magenta
+          "gpu": "32", "gpu_mem": "32", "cpu": "34", "ram": "34"}  # green / blue
+# lane -> (label, value format, reference line; "rated" = the PD contract watts)
+LANE_META = {"draw": ("draw", "{:.1f}W", "rated"),
+             "charger": ("charger", "{:.1f}W", "rated"),
+             "compute": ("compute", "{:.1f}W", None),
+             "battery": ("battery", "{:+.1f}W", 0.0),
+             "gpu": ("gpu", "{:.0f}%", None),
+             "gpu_mem": ("gpu mem", "{:.1f}GB", None),
+             "cpu": ("cpu", "{:.0f}%", None),
+             "ram": ("ram", "{:.1f}GB", None)}
 TTY = sys.stdout.isatty()
 
 
@@ -158,12 +168,119 @@ def ioreg_battery():
     }
 
 
+def _gpu_from_stats(ps):
+    """Pure parse of IOAccelerator PerformanceStatistics; None if unusable.
+
+    'In use system memory' is GPU memory, not system memory — verified by
+    correlation on this hardware 2026-09-07: it tracked 1.8 -> 31.2 GB as
+    utilization went 40% -> 99% while system RAM stayed flat at ~28 GB.
+    """
+    util, mem = ps.get("Device Utilization %"), ps.get("In use system memory")
+    if util is None or mem is None:
+        return None
+    return {"util_pct": float(util), "mem_inuse_gb": mem / 2**30}
+
+
+def ioreg_gpu():
+    """Global GPU utilization + memory (no sudo). None -> group omitted entirely."""
+    try:
+        out = subprocess.run(["ioreg", "-a", "-r", "-c", "IOAccelerator"],
+                             capture_output=True, timeout=10).stdout
+        for node in plistlib.loads(out) or []:
+            g = _gpu_from_stats(node.get("PerformanceStatistics") or {})
+            if g:
+                return g
+    except Exception:  # no accelerator / timeout / bad plist — degrade, never fail
+        return None
+    return None
+
+
+# ── host CPU / RAM: mach host_statistics over ctypes ────────────────────────────
+# Same ctypes idiom as the SMC engine above, and far cheaper than forking
+# `vm_stat`/`ps` each frame (measured 2026-09-07: mach call unmeasurable vs an
+# ~18 ms ioreg fork). argtypes are mandatory here for the same 64-bit reason.
+_HOST_CPU_LOAD_INFO, _HOST_VM_INFO64, _PAGE = 3, 4, 16384
+_U32, _U64 = ctypes.c_uint32, ctypes.c_uint64
+
+
+class _CpuLoad(ctypes.Structure):
+    _fields_ = [("ticks", _U32 * 4)]  # user, system, idle, nice
+
+
+class _VMStat64(ctypes.Structure):    # vm_statistics64; full struct so the
+    _pack_ = 8                        # kernel's count check matches (38 u32s)
+    _fields_ = [("free", _U32), ("active", _U32), ("inactive", _U32), ("wire", _U32),
+                ("zero_fill", _U64), ("reactivations", _U64), ("pageins", _U64),
+                ("pageouts", _U64), ("faults", _U64), ("cow_faults", _U64),
+                ("lookups", _U64), ("hits", _U64), ("purges", _U64),
+                ("purgeable", _U32), ("speculative", _U32), ("decompressions", _U64),
+                ("compressions", _U64), ("swapins", _U64), ("swapouts", _U64),
+                ("compressor", _U32), ("throttled", _U32), ("external", _U32),
+                ("internal", _U32), ("uncompressed_in_compressor", _U64)]
+
+
+def _ram_gb(active, wire, comp, page=_PAGE):
+    """Used RAM = active + wired + compressed pages. Matches `vm_stat` exactly.
+
+    Note wired includes GPU allocations on unified memory, so this figure and
+    `gpu_mem` overlap heavily rather than being independent quantities.
+    """
+    return (active + wire + comp) * page / 2**30
+
+
+def cpu_pct_from_ticks(prev, cur):
+    """Busy % across one interval between two HOST_CPU_LOAD_INFO samples."""
+    d = [b - a for a, b in zip(prev, cur)]
+    total = sum(d)
+    return 100.0 * (d[0] + d[1] + d[3]) / total if total > 0 else 0.0  # +nice
+
+
+def host_or_none():
+    """Host(), or None if mach is unavailable — the system group then never appears."""
+    try:
+        return Host()
+    except Exception:  # optional data source: a monitor must not die without it
+        return None
+
+
+class Host:
+    """CPU% and RAM over mach. CPU is a delta, so the first read is a baseline."""
+
+    def __init__(self):
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        libc.mach_host_self.restype = _U32
+        for fn in (libc.host_statistics, libc.host_statistics64):
+            fn.argtypes = [_U32, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_U32)]
+        libc.sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p,
+                                      ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                                      ctypes.c_size_t]
+        self._libc, self._port = libc, libc.mach_host_self()
+        mem, sz = _U64(), ctypes.c_size_t(8)
+        libc.sysctlbyname(b"hw.memsize", ctypes.byref(mem), ctypes.byref(sz), None, 0)
+        self.total_gb = mem.value / 2**30
+        self._prev = self._ticks()
+
+    def _ticks(self):
+        b, n = _CpuLoad(), _U32(4)
+        self._libc.host_statistics(self._port, _HOST_CPU_LOAD_INFO,
+                                   ctypes.byref(b), ctypes.byref(n))
+        return list(b.ticks)
+
+    def read(self):
+        cur = self._ticks()
+        cpu, self._prev = cpu_pct_from_ticks(self._prev, cur), cur
+        v, n = _VMStat64(), _U32(ctypes.sizeof(_VMStat64) // 4)
+        self._libc.host_statistics64(self._port, _HOST_VM_INFO64,
+                                     ctypes.byref(v), ctypes.byref(n))
+        return {"cpu_pct": cpu, "ram_gb": _ram_gb(v.active, v.wire, v.compressor)}
+
+
 def battery_flow_w(bat):
     # positive = charging. ioreg amperage is signed and matches the true direction.
     return bat.get("amperage_ma", 0.0) * bat.get("voltage_mv", 0.0) / 1e6
 
 
-def read_sample(smc):
+def read_sample(smc, host=None):
     p = smc.read_flt
     s = ioreg_battery()
     connected = s["adapter"]["connected"]
@@ -171,12 +288,50 @@ def read_sample(smc):
     s["adapter_power_w"] = p("PDTR") if connected else 0.0  # delivering
     s["compute_w"] = p("PHPS")                          # CPU/SoC compute rail
     s["battery_flow_w"] = battery_flow_w(s["battery"])
+    gpu = ioreg_gpu()
+    if gpu:                       # absent accelerator -> key omitted, group dropped
+        s["gpu"] = gpu
+    if host:
+        s["host"] = host.read()
+        s["ram_total_gb"] = host.total_gb
     return s
 
 
 def lane_values(s):
-    return {"draw": s["sys_power_w"], "charger": s["adapter_power_w"],
-            "compute": s["compute_w"], "battery": s["battery_flow_w"]}
+    """Lane name -> value. GPU/host lanes appear only when the sample has them:
+    a missing rail must vanish, not read 0.0 and draw a flat line that isn't real."""
+    v = {"draw": s["sys_power_w"], "charger": s["adapter_power_w"],
+         "compute": s["compute_w"], "battery": s["battery_flow_w"]}
+    if s.get("gpu"):
+        v["gpu"], v["gpu_mem"] = s["gpu"]["util_pct"], s["gpu"]["mem_inuse_gb"]
+    if s.get("host"):
+        v["cpu"], v["ram"] = s["host"]["cpu_pct"], s["host"]["ram_gb"]
+    return v
+
+
+def active_groups(s):
+    """Groups this sample can actually fill; the rest are dropped entirely."""
+    have = lane_values(s)
+    return tuple((name, lanes) for name, lanes in GROUPS
+                 if all(lane in have for lane in lanes))
+
+
+# Bounded metrics get fixed scales. Auto-scaling a percentage is actively
+# misleading — a GPU steady at 40% would fill its panel and read as pegged.
+# Only unbounded quantities (watts) scale to the data they see.
+PCT_LANES = ("gpu", "cpu")
+MEM_LANES = ("gpu_mem", "ram")
+
+
+def lane_scale(lane, vals, hi_floor=None, total_gb=0.0):
+    """(y_min, y_max) for one lane: fixed for bounded metrics, dynamic for watts."""
+    if lane in PCT_LANES:
+        return 0.0, 100.0
+    if lane in MEM_LANES:
+        return 0.0, float(total_gb or 1.0)
+    lo = min(0.0, min(vals))                       # 0-anchored, padded, >=2 tall
+    hi = max(max(vals), hi_floor or 0) * 1.05 + 1
+    return lo, max(hi, lo + 2)
 
 
 # ── snapshot ─────────────────────────────────────────────────────────────────────
@@ -231,10 +386,33 @@ def _header(word, col, flow):
 def _row(label, value, unit, bar="", dim=False):
     """One ledger row: label, right-aligned value+unit, then its bar — all columns
     aligned. Padding is on visible text, so `bar`'s color codes never shift it."""
-    lab, val = f"{label:<8}", f"{value:>3.0f} {unit}"
+    # right-justify "value unit" as one token so a 2-char unit (GB) keeps the bar
+    # column fixed. Identical to the old f"{value:>3.0f} {unit}" for W and %.
+    lab, val = f"{label:<8}", f"{value:.0f} {unit}".rjust(5)
     if dim:
         lab, val = c("90", lab), c("90", val)
     return f"     {lab}{val}   {bar}".rstrip()
+
+
+def _resource_rows(s):
+    """gpu/cpu/ram rows, each on its OWN denominator (100%, installed RAM).
+
+    Split from the watt ledger by a blank line: the two families share no scale,
+    and adjacency without that gap would imply they are comparable.
+    """
+    g, h = s.get("gpu"), s.get("host")
+    if not (g or h):
+        return []
+    total = s.get("ram_total_gb") or 0.0
+    gb_bar = lambda v, col: _bar(v / total, col, _BAR_W) if total else ""
+    rows = [""]
+    if g:
+        rows += [_row("gpu", g["util_pct"], "%", _bar(g["util_pct"] / 100, "32", _BAR_W)),
+                 _row("gpu mem", g["mem_inuse_gb"], "GB", gb_bar(g["mem_inuse_gb"], "32"))]
+    if h:
+        rows += [_row("cpu", h["cpu_pct"], "%", _bar(h["cpu_pct"] / 100, "34", _BAR_W)),
+                 _row("ram", h["ram_gb"], "GB", gb_bar(h["ram_gb"], "34"))]
+    return rows
 
 
 def _snapshot_lines(s):
@@ -247,7 +425,7 @@ def _snapshot_lines(s):
         ctx = ([_time_hint(s)] if _time_hint(s) else []) + [f"{bat['temperature_c']:.0f}°C"]
         return lines + [_row("battery", bat["percent"], "%"),
                         _row("draw", pull, "W"),
-                        "     " + c("90", " · ".join(ctx))]
+                        "     " + c("90", " · ".join(ctx))] + _resource_rows(s)
 
     scale = max(ad["watts"], pull, deliver) or 1.0        # shared scale; rated = the ceiling
     return lines + [
@@ -255,7 +433,7 @@ def _snapshot_lines(s):
         _row("draw", pull, "W", _bar(pull / scale, "33", _BAR_W)),
         _row("charger", deliver, "W", _bar(deliver / scale, "36", _BAR_W)),
         _row("rated", ad["watts"], "W", c("90", "░" * _BAR_W), dim=True),  # dim ceiling reference
-    ]
+    ] + _resource_rows(s)
 
 
 def _status_line(s):
@@ -321,27 +499,55 @@ def braille_chart(vals, color, width, height, y_min, y_max, ref=None):
     return lines
 
 
-def panel(title, color, vals, width, y_min, y_max, ref=None):
+def panel(title, color, vals, width, y_min, y_max, ref=None, height=PANEL_H):
     """mactop-style bordered box: title in the frame, chart inside. No emoji in
     titles — terminals render them double-width and break border alignment."""
     inner = width + 6  # chart + y-axis labels
     head = f" {title} "
     top = "╭─" + c(color, head) + "─" * max(0, inner - len(head) - 1) + "╮"
     body = ["│" + row + "│" for row in
-            braille_chart(vals, color, width, PANEL_H, y_min, y_max, ref)]
+            braille_chart(vals, color, width, height, y_min, y_max, ref)]
     return [top] + body + ["╰" + "─" * inner + "╯"]
 
 
-def side_by_side(left, right):
-    return [l + " " + r for l, r in zip(left, right)]
+def side_by_side(*cols):
+    """Join N equal-height panel blocks into one row of lines."""
+    return [" ".join(parts) for parts in zip(*cols)]
 
 
 # ── watch ────────────────────────────────────────────────────────────────────────
-LANES = ("draw", "charger", "compute", "battery")
+# Three groups, each laid out as its own band of panel rows. A group never shares
+# a row with another group — that isolation is what makes the grouping readable.
+GROUPS = (("energy", ("draw", "charger", "compute", "battery")),
+          ("gpu", ("gpu", "gpu_mem")),
+          ("system", ("cpu", "ram")))
+LANES = tuple(lane for _, lanes in GROUPS for lane in lanes)
+PER_ROW = 2          # always 2 wide: keeps charts readable at any terminal size
+COMPACT_H = 2        # one deliberate density step, not a gradual squeeze
 
 
-def panel_width():  # per-panel chart cells, from the live terminal width
-    return max(24, min(80, (shutil.get_terminal_size().columns - 2 * 9) // 2))
+def grid_rows(groups=GROUPS, per_row=PER_ROW):
+    """Flatten groups into panel rows, never mixing two groups in one row."""
+    return [list(lanes[i:i + per_row])
+            for _, lanes in groups for i in range(0, len(lanes), per_row)]
+
+
+def lane_panel(lane, vals, width, height, rated, total_gb):
+    """One lane rendered as a bordered chart, with its own correctly-bounded axis."""
+    label, fmt, ref = LANE_META[lane]
+    color = ("32" if vals[-1] >= 0 else "31") if lane == "battery" else COLORS[lane]
+    ref = rated if ref == "rated" else ref
+    lo, hi = lane_scale(lane, vals, hi_floor=ref if lane in ("draw", "charger") else None,
+                        total_gb=total_gb)
+    return panel(f"{label} {fmt.format(vals[-1])}", color, vals, width, lo, hi,
+                 ref=ref, height=height)
+
+
+def panel_geom(cols, lines, n_rows, per_row=PER_ROW):
+    """(chart width, chart height). Width generalizes today's (cols - 2*9)//2."""
+    width = max(24, min(80, (cols - 9 * per_row) // per_row))
+    full = n_rows * (PANEL_H + 2) + 1 <= lines
+    return width, (PANEL_H if full else COMPACT_H)
 
 
 def watch(seconds, interval_ms, log_path=None):
@@ -350,14 +556,11 @@ def watch(seconds, interval_ms, log_path=None):
     except OSError as e:
         sys.exit(f"pdraw: cannot read power — {e}")
     logf = open(log_path, "a") if log_path else None  # JSONL, one sample per line
-    width = panel_width()
+    host = host_or_none()
+    term = shutil.get_terminal_size()
+    width, panel_h = panel_geom(term.columns, term.lines, len(grid_rows()))
     hist = {k: deque(maxlen=width * 2) for k in LANES}
     start, frame = time.monotonic(), []
-
-    def rng(vals, hi_floor=None):  # per-panel scale: 0-anchored, padded, ≥2W tall
-        lo = min(0.0, min(vals))
-        hi = max(max(vals), hi_floor or 0) * 1.05 + 1
-        return lo, max(hi, lo + 2)
 
     def _on_term(*_):  # `kill` would skip the finally and strand the terminal in
         raise KeyboardInterrupt  # the alt-screen; reroute it through the same teardown
@@ -368,11 +571,14 @@ def watch(seconds, interval_ms, log_path=None):
         sys.stdout.flush()
     try:
         while True:
-            s = read_sample(smc)
+            s = read_sample(smc, host)
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
-            w = panel_width()
+            # groups absent from this sample are dropped, never drawn empty
+            rows = grid_rows(active_groups(s))
+            term = shutil.get_terminal_size()
+            w, panel_h = panel_geom(term.columns, term.lines, len(rows))
             if w != width:  # terminal resized: re-flow panels, re-cap history to fit
                 width = w   # deque(old, maxlen=n) keeps the most recent n samples
                 hist = {k: deque(hist[k], maxlen=width * 2) for k in LANES}
@@ -380,21 +586,15 @@ def watch(seconds, interval_ms, log_path=None):
                 hist[k].append(v)
             ad, bat = s["adapter"], s["battery"]
             rated = ad["watts"] if ad["connected"] else None
-            bat_col = "32" if hist["battery"][-1] >= 0 else "31"
-            top = side_by_side(
-                panel(f"draw {hist['draw'][-1]:.1f}W", COLORS["draw"],
-                      hist["draw"], width, *rng(hist["draw"], rated), ref=rated),
-                panel(f"charger {hist['charger'][-1]:.1f}W", COLORS["charger"],
-                      hist["charger"], width, *rng(hist["charger"], rated), ref=rated))
-            bottom = side_by_side(
-                panel(f"compute {hist['compute'][-1]:.1f}W", COLORS["compute"],
-                      hist["compute"], width, *rng(hist["compute"])),
-                panel(f"battery {hist['battery'][-1]:+.1f}W", bat_col,
-                      hist["battery"], width, *rng(hist["battery"]), ref=0))
+            total_gb = host.total_gb if host else 0.0
+            frame = []
+            for row in rows:
+                frame += side_by_side(*(lane_panel(k, hist[k], width, panel_h,
+                                                   rated, total_gb) for k in row))
             status = f"rated {rated}W ┄" if rated else "ON BATTERY"
-            frame = top + bottom + [
-                f" {status} · batt {bat['percent']:.0f}% · "
-                f"{len(hist['draw'])} samples @ {interval_ms}ms · {time.strftime('%H:%M:%S')}"]
+            frame += [f" {status} · batt {bat['percent']:.0f}% · "
+                      f"{len(hist['draw'])} samples @ {interval_ms}ms · "
+                      f"{time.strftime('%H:%M:%S')}"]
             if TTY:  # redraw from home + clear-to-end: resilient to resize/clear,
                 sys.stdout.write(  # no prev_lines bookkeeping to drift out of sync
                     "\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
@@ -428,6 +628,36 @@ def selftest():
     assert any(0x2800 <= ord(ch) <= 0x28FF for line in box for ch in line), box
     assert panel("flat", "36", [5, 5], 10, 5, 5) is not None  # zero-span guard
     assert side_by_side(["a", "b"], ["c", "d"]) == ["a c", "b d"]
+
+    # bounded lanes get FIXED scales — auto-scaling a percentage makes a GPU
+    # idling at 40% look pegged. Only unbounded (watt) lanes scale to data.
+    assert lane_scale("gpu", [10, 20, 30], total_gb=48) == (0.0, 100.0)
+    assert lane_scale("cpu", [1, 2], total_gb=48) == (0.0, 100.0)
+    assert lane_scale("ram", [3, 4], total_gb=48) == (0.0, 48.0)
+    assert lane_scale("gpu_mem", [1], total_gb=48) == (0.0, 48.0)
+    lo, hi = lane_scale("draw", [10, 60], hi_floor=140, total_gb=48)
+    assert lo == 0.0 and hi > 140, (lo, hi)          # watts still dynamic, honors rated
+
+    # GPU stats parse (pure, no ioreg): both fields required or the group is omitted
+    g = _gpu_from_stats({"Device Utilization %": 47, "In use system memory": 2 * 2**30})
+    assert g == {"util_pct": 47.0, "mem_inuse_gb": 2.0}, g
+    assert _gpu_from_stats({}) is None                          # no accelerator node
+    assert _gpu_from_stats({"Device Utilization %": 5}) is None  # partial -> omit group
+
+    # host CPU/RAM math kept pure so it tests without mach
+    assert _ram_gb(active=1, wire=1, comp=2, page=2**30) == 4.0
+    assert cpu_pct_from_ticks([0, 0, 0, 0], [10, 10, 80, 0]) == 20.0  # 20 busy of 100
+    assert cpu_pct_from_ticks([5, 5, 5, 5], [5, 5, 5, 5]) == 0.0      # no ticks elapsed
+    assert cpu_pct_from_ticks([0, 0, 0, 0], [0, 0, 0, 50]) == 100.0   # nice counts as busy
+
+    # groups never share a panel row — that isolation IS the grouping
+    assert grid_rows((("a", ("x",)), ("b", ("y",)))) == [["x"], ["y"]]
+    assert grid_rows(GROUPS) == [["draw", "charger"], ["compute", "battery"],
+                                 ["gpu", "gpu_mem"], ["cpu", "ram"]]
+    # today's 2-wide width formula is preserved exactly at 100 cols
+    assert panel_geom(100, 40, n_rows=2)[0] == 41, panel_geom(100, 40, n_rows=2)
+    assert panel_geom(100, 40, n_rows=4)[1] == PANEL_H     # 4 rows fit 40 lines
+    assert panel_geom(100, 20, n_rows=4)[1] == COMPACT_H   # they don't fit 20 -> compact
     flow = battery_flow_w({"amperage_ma": 5791, "voltage_mv": 12559})
     assert abs(flow - 72.73) < 0.01, flow          # charging = positive
     assert battery_flow_w({"amperage_ma": -413, "voltage_mv": 13007}) < 0  # draining = negative
@@ -436,6 +666,10 @@ def selftest():
     assert "\n" not in rec and json.loads(rec)["t"] == 123.4, rec
     assert _bar(0.5, "36", 10).count("█") == 5, _bar(0.5, "36", 10)  # half-fill, no track
     assert _bar(2, "36", 10) == c("36", "█" * 10), "over-range clamps to full"
+    # a 2-char unit must not shift the bar column: "136 W" and "31 GB" both take 5 cells
+    assert _row("draw", 136, "W", "BAR").index("BAR") == \
+           _row("ram", 31, "GB", "BAR").index("BAR"), (_row("draw", 136, "W", "BAR"),
+                                                       _row("ram", 31, "GB", "BAR"))
     fake = {"adapter": {"connected": True, "watts": 140, "voltage_mv": 28000,
                         "current_ma": 4700, "name": "pd charger", "menu": [(5, 3), (20, 5)]},
             "battery": {"percent": 68, "amperage_ma": -720, "voltage_mv": 12030,
@@ -454,6 +688,39 @@ def selftest():
     assert any("On battery" in ln for ln in _snapshot_lines(onbat))
     assert not any("█" in ln for ln in _snapshot_lines(onbat))    # no watt bars off-adapter
     assert "on battery" in _status_line(onbat) and "92m left" in _status_line(onbat)
+
+    # new lanes resolve from the sample; absent data OMITS the lane rather than
+    # reporting 0.0, which would plot a confident flat line that isn't real
+    assert "gpu" not in lane_values(fake) and "cpu" not in lane_values(fake)
+    rich = {**fake, "gpu": {"util_pct": 40.0, "mem_inuse_gb": 3.0},
+            "host": {"cpu_pct": 12.0, "ram_gb": 20.0}}
+    lv = lane_values(rich)
+    assert (lv["gpu"], lv["gpu_mem"], lv["cpu"], lv["ram"]) == (40.0, 3.0, 12.0, 20.0), lv
+    assert lv["draw"] == 136.3, lv                       # existing lanes untouched
+    assert grid_rows(active_groups(fake)) == [["draw", "charger"], ["compute", "battery"]]
+    assert len(grid_rows(active_groups(rich))) == 4      # all three groups present
+
+    box = lane_panel("gpu", [10, 40], width=12, height=PANEL_H, rated=140, total_gb=48)
+    assert "gpu 40%" in box[0] and len(box) == PANEL_H + 2, box[0]
+    # axis rows are labelled at their midpoint, so a fixed 0-100 span tops at 90.
+    # Auto-scaled to this data (max 40) it would read ~39 — that gap is the test.
+    assert "90" in box[1], box[1]
+    mem = lane_panel("ram", [20, 29], width=12, height=PANEL_H, rated=140, total_gb=48)
+    assert "ram 29.0GB" in mem[0] and "43" in mem[1], (mem[0], mem[1])  # 0-48 fixed
+    neg = lane_panel("battery", [-5, -8], width=12, height=PANEL_H, rated=140, total_gb=48)
+    assert "battery -8.0W" in neg[0], neg[0]             # signed format kept
+
+    # snapshot: gpu/cpu rows must use THEIR OWN denominators, never the watt scale.
+    # 40% of a 28-cell bar is 11 blocks; on the 140 W ledger scale it would be 8.
+    snap2 = _snapshot_lines({**rich, "ram_total_gb": 48.0})
+    txt = "\n".join(snap2)
+    assert "gpu" in txt and "cpu" in txt and "ram" in txt, txt
+    gpu_row = next(l for l in snap2 if "gpu " in l and "mem" not in l)
+    assert gpu_row.count("█") == 11, (gpu_row, gpu_row.count("█"))
+    gi = next(i for i, l in enumerate(snap2) if "gpu " in l and "mem" not in l)
+    assert snap2[gi - 1] == "", snap2[gi - 2:gi + 1]  # blank splits the scale families
+    # without gpu/host data those rows must not appear at all
+    assert not any("gpu" in l or "cpu" in l for l in _snapshot_lines(fake))
     try:  # live read if on real hardware — energy balance sanity
         s = read_sample(SMC())
         assert s["sys_power_w"] > 0, s["sys_power_w"]
@@ -485,8 +752,11 @@ def main():
             sys.exit("pdraw: mactop not installed — brew install mactop")
         os.execvp("mactop", ["mactop"])
     if (args.snapshot or args.json) and not args.log:  # one-shot paths; --log forces the loop
+        host = host_or_none()
+        if host:
+            time.sleep(0.1)   # CPU% is a tick delta — a one-shot needs a brief window
         try:
-            sample = read_sample(SMC())
+            sample = read_sample(SMC(), host)
         except OSError as e:
             sys.exit(f"pdraw: cannot read power — {e}")
         if args.json:

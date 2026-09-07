@@ -14,8 +14,9 @@ adapter detail come from `ioreg`.
 ## Usage
 
 ```
-pdraw              # live 2x2 plot: draw / charger / compute / battery,
-                   # each boxed with its own scale; Ctrl-C to stop
+pdraw              # live grouped plot, 2 wide: energy (draw / charger /
+                   # compute / battery), gpu (util / memory), system
+                   # (cpu / ram); each boxed; Ctrl-C to stop
 pdraw -w SECS      # watch for SECS then stop
 pdraw --log FILE   # watch and append each sample as JSONL to FILE
 pdraw -i 250       # sample interval in ms (default 500)
@@ -34,14 +35,29 @@ Snapshot (`pdraw -s`):
      draw    136 W   ███████████████████████████▎
      charger 132 W   ██████████████████████████▎
      rated   140 W   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+
+     gpu      39 %   ██████████▉
+     gpu mem  31 GB  ██████████████████▎
+     cpu      18 %   █████
+     ram      43 GB  █████████████████████████▎
 ```
 
 The header is the whole story: `Net drain` with a negative number means the
 battery is losing charge while plugged in — an undersized charger. The ledger
 shows why: the charger delivers less than the system draws, and both sit under
 the charger's rated ceiling. `battery` / `draw` / `charger` bars share one scale
-(the charger's rated max, shown as the dim ceiling). Piped or non-interactive,
-`-s` collapses to one line:
+(the charger's rated max, shown as the dim ceiling).
+
+Below the blank line sits a second block on **different** denominators — `gpu`
+and `cpu` against 100%, `gpu mem` and `ram` against installed memory. The gap is
+deliberate: those bars are not comparable with the watt bars above them. Bounded
+metrics are never auto-scaled, so a GPU steady at 40% reads as 40% rather than
+filling its panel. Note `gpu mem` is a large *subset* of `ram`, not additive —
+on unified memory, GPU allocations are charged as wired pages.
+
+The gpu and system blocks are omitted entirely when their data is unavailable,
+leaving the original output untouched. Piped or non-interactive, `-s` collapses
+to one line:
 
 ```
 net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
@@ -50,6 +66,9 @@ net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
 ## Requirements
 
 - Apple Silicon Mac, python3 (stdlib only). Nothing to install, no sudo.
+- GPU figures come from `ioreg IOAccelerator`; CPU and RAM from mach
+  `host_statistics` over ctypes — no subprocess, no per-process attribution
+  (macOS does not expose per-process GPU on Apple Silicon).
 - `pdraw top` runs [mactop](https://github.com/metaspartan/mactop) if you have it
   (`brew install mactop`); everything else is self-contained.
 
