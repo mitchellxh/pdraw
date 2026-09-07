@@ -284,7 +284,7 @@ _KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
          " ": "pgdn", "b": "pgup", "r": "reverse",
          "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem",
          "p": "sort_pid", "n": "sort_name"}
-SORT_KEYS = {"sort_cpu": "cpu_ms_s", "sort_energy": "energy", "sort_mem": "rss_mb",
+SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_energy": "energy", "sort_mem": "rss_mb",
              "sort_pid": "pid", "sort_name": "name"}
 _ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
 
@@ -430,7 +430,7 @@ class PowerMetrics:
 # they are stated once instead of repeated on every row.
 _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("PROCESS", 0, "name", None),                       # 0 = the flex column
-         ("CPU ms/s", 10, "cpu_ms_s", lambda v: f"{v:.1f}"),
+         ("CPU%", 8, "cpu_pct", lambda v: f"{v:.1f}"),
          ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"),
          ("MEM MB", 9, "rss_mb", lambda v: f"{v:.0f}"))
 
@@ -553,7 +553,7 @@ def _mach_timebase():
     tb = _MachTimebase()
     try:
         _LIBPROC.mach_timebase_info(ctypes.byref(tb))
-    except Exception:
+    except (AttributeError, OSError):   # symbol absent -> assume ticks are ns
         return (1, 1)
     return (tb.numer or 1, tb.denom or 1)
 
@@ -570,6 +570,18 @@ def _ticks_to_ms(ticks, numer, denom):
     instead of 1000.
     """
     return ticks * numer / denom / 1e6
+
+
+def _cpu_percent(ticks, dt, timebase=None):
+    """CPU as a percentage of ONE core over `dt` seconds.
+
+    top's and Activity Monitor's convention: 100% is one core saturated, and a
+    threaded process legitimately exceeds it (this machine has 18 cores, so the
+    ceiling is 1800%). Chosen over powermetrics' ms/s because it needs no
+    explanation -- 1000 ms/s meaning "one core" is not self-evident.
+    """
+    numer, denom = timebase or TIMEBASE
+    return _ticks_to_ms(ticks, numer, denom) / dt / 10.0
 
 
 class Processes:
@@ -599,8 +611,7 @@ class Processes:
             rows.append({
                 "pid": pid,
                 "name": proc_name(pid) or "?",
-                "cpu_ms_s": (_ticks_to_ms(ticks - was, *TIMEBASE) / dt
-                             if was is not None else 0.0),
+                "cpu_pct": _cpu_percent(ticks - was, dt) if was is not None else 0.0,
                 "rss_mb": info.pti_resident_size / 2**20,
                 "energy": None,          # only powermetrics-as-root can fill this
             })
@@ -1093,7 +1104,7 @@ def watch(seconds, interval_ms, log_path=None):
 # CPU, memory, names and the pid list all come from libproc with no sudo. Only
 # IMPACT needs powermetrics as root, so it is opt-in (--energy) rather than a
 # toll everyone pays: one column's requirement should not be the view's.
-def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_ms_s", reverse=True,
+def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
                 show_energy=False):
     """Header of global state, then a sorted, scrollable window of processes."""
     bits = []
@@ -1145,7 +1156,7 @@ def procs(seconds, interval_ms, want_energy=False):
 
     keys = None
     off, start, frame, done = 0, time.monotonic(), [], False
-    sort_key, reverse = ("energy" if show_energy else "cpu_ms_s"), True
+    sort_key, reverse = ("energy" if show_energy else "cpu_pct"), True
     source.sample()          # CPU is a delta; discard the baseline sample
 
     def view_rows():
@@ -1336,13 +1347,20 @@ def selftest():
     assert _ticks_to_ms(0, 125, 3) == 0.0
     assert TIMEBASE[1] > 0, TIMEBASE                     # denom must never be 0
 
+    # CPU as a percentage of ONE core -- top's and Activity Monitor's convention.
+    # 100% is one core saturated; a threaded process legitimately exceeds it.
+    assert abs(_cpu_percent(24_000_000, 1.0, (125, 3)) - 100.0) < 0.1
+    assert abs(_cpu_percent(48_000_000, 1.0, (125, 3)) - 200.0) < 0.1   # two cores
+    assert abs(_cpu_percent(24_000_000, 2.0, (125, 3)) - 50.0) < 0.1    # half as busy
+    assert _cpu_percent(0, 1.0, (125, 3)) == 0.0
+
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
     src = Processes()
     src.sample()                       # first sample establishes the CPU baseline
     live_rows = src.sample()
     assert live_rows, "libproc must enumerate our processes"
-    assert all({"pid", "name", "cpu_ms_s", "rss_mb"} <= set(r) for r in live_rows)
+    assert all({"pid", "name", "cpu_pct", "rss_mb"} <= set(r) for r in live_rows)
     assert any(r["pid"] == os.getpid() for r in live_rows), "our own process must appear"
     assert all(r["energy"] is None for r in live_rows), "no energy without powermetrics"
     # the invariant is readability, not non-emptiness: a zombie or exiting
@@ -1359,15 +1377,15 @@ def selftest():
     # units belong in the header, not repeated per row; and IMPACT is Apple's
     # unitless Energy Impact score -- NOT watts (measured: task impacts sum to
     # 464-2223 while the machine drew 20-40 W, and impact/cpu varies 36x)
-    trows = [{"pid": 11, "name": "python3.12", "cpu_ms_s": 142.3, "energy": 88.4,
+    trows = [{"pid": 11, "name": "python3.12", "cpu_pct": 142.3, "energy": 88.4,
               "rss_mb": 8600.0},
-             {"pid": 1258, "name": "WindowServer", "cpu_ms_s": 9.9, "energy": 3.1,
+             {"pid": 1258, "name": "WindowServer", "cpu_pct": 9.9, "energy": 3.1,
               "rss_mb": None},
-             {"pid": 987, "name": "distnoted", "cpu_ms_s": 0.4, "energy": 0.1,
+             {"pid": 987, "name": "distnoted", "cpu_pct": 0.4, "energy": 0.1,
               "rss_mb": 1.5}]
     tbl = proc_table(trows)
     hdr = next(l for l in tbl if "PID" in l)
-    assert "IMPACT/s" in hdr and "MEM MB" in hdr and "CPU ms/s" in hdr, hdr
+    assert "IMPACT/s" in hdr and "MEM MB" in hdr and "CPU%" in hdr, hdr
     assert "ENERGY" not in hdr, "ENERGY reads as watts; it is a unitless score"
     body = next(l for l in tbl if "python3.12" in l)
     assert "8600" in body and "G" not in body, body      # bare number, unit in header
@@ -1375,9 +1393,9 @@ def selftest():
     assert all(len(l) == len(hdr) for l in tbl if l.strip() and "─" not in l)
 
     # sorting: any column, either direction, unknowns always last
-    by_cpu = sort_rows(trows, "cpu_ms_s")
+    by_cpu = sort_rows(trows, "cpu_pct")
     assert [r["pid"] for r in by_cpu] == [11, 1258, 987], by_cpu
-    assert [r["pid"] for r in sort_rows(trows, "cpu_ms_s", reverse=False)] == [987, 1258, 11]
+    assert [r["pid"] for r in sort_rows(trows, "cpu_pct", reverse=False)] == [987, 1258, 11]
     by_mem = sort_rows(trows, "rss_mb")
     assert [r["pid"] for r in by_mem] == [11, 987, 1258], "unknown memory sorts last"
     assert [r["pid"] for r in sort_rows(trows, "rss_mb", reverse=False)] == [987, 11, 1258], \
@@ -1385,16 +1403,16 @@ def selftest():
     assert sort_rows(trows, "name", reverse=False)[0]["name"] == "distnoted"
 
     # the active sort column is marked, so the view is self-describing
-    marked = next(l for l in proc_table(trows, sort_key="cpu_ms_s") if "PID" in l)
+    marked = next(l for l in proc_table(trows, sort_key="cpu_pct") if "PID" in l)
     assert "▼" in marked and marked.index("▼") > marked.index("CPU"), marked
-    up = next(l for l in proc_table(trows, sort_key="cpu_ms_s", reverse=False) if "PID" in l)
+    up = next(l for l in proc_table(trows, sort_key="cpu_pct", reverse=False) if "PID" in l)
     assert "▲" in up, up
 
     # pressing a sort key twice flips direction; a different key starts descending
-    assert next_sort("energy", True, "sort_cpu") == ("cpu_ms_s", True)
-    assert next_sort("cpu_ms_s", True, "sort_cpu") == ("cpu_ms_s", False)
-    assert next_sort("cpu_ms_s", False, "sort_cpu") == ("cpu_ms_s", True)
-    assert next_sort("cpu_ms_s", False, "sort_mem") == ("rss_mb", True)
+    assert next_sort("energy", True, "sort_cpu") == ("cpu_pct", True)
+    assert next_sort("cpu_pct", True, "sort_cpu") == ("cpu_pct", False)
+    assert next_sort("cpu_pct", False, "sort_cpu") == ("cpu_pct", True)
+    assert next_sort("cpu_pct", False, "sort_mem") == ("rss_mb", True)
 
     # colour must separate the long tail. Process load is heavily skewed -- with
     # ~375 processes almost everything sits under 15% of the max -- so a linear
@@ -1407,9 +1425,9 @@ def selftest():
     import re as _re
     def _shades(tbl):
         return [(_re.findall(r"38;5;(\d+)", l) or ["-"])[0] for l in tbl[2:]]
-    desc = proc_table(sort_rows(trows, "cpu_ms_s"), sort_key="cpu_ms_s")
-    asc = proc_table(sort_rows(trows, "cpu_ms_s", reverse=False),
-                     sort_key="cpu_ms_s", reverse=False)
+    desc = proc_table(sort_rows(trows, "cpu_pct"), sort_key="cpu_pct")
+    asc = proc_table(sort_rows(trows, "cpu_pct", reverse=False),
+                     sort_key="cpu_pct", reverse=False)
     assert _shades(desc) == list(reversed(_shades(asc))), (_shades(desc), _shades(asc))
 
     # sort keys reach parse_keys
