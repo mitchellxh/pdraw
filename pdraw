@@ -440,10 +440,10 @@ class Host:
         return {"cpu_pct": cpu, "ram_gb": _ram_gb(v.active, v.wire, v.compressor)}
 
 
-BATTERY_POLL_S = 2.0   # AppleSmartBattery refreshes every ~35s (measured on this
-                       # hardware 2026-09-07: gaps min 35.0s, max 35.0s). Polling it
-                       # per 500ms tick re-forked ioreg ~70x per real change at ~18ms
-                       # a fork, so hold the reading and re-read on wall-clock.
+BATTERY_POLL_S = 5.0   # AppleSmartBattery refreshes every ~35-43s (measured on this
+                       # hardware 2026-09-07), so per-tick polling re-forked ioreg at
+                       # ~18ms a fork for no new data. 5s not 2s: at -i 2000 a 2s
+                       # period re-read on every tick (291/291), leaving it inert.
 
 
 class BatteryCache:
@@ -727,6 +727,18 @@ def _chunk(lanes, per_row=PER_ROW):
     return [list(lanes[i:i + per_row]) for i in range(0, len(lanes), per_row)]
 
 
+def sleep_remainder(started, interval_ms, clock=time.monotonic, sleep=time.sleep):
+    """Sleep only what is left of the interval, so the period IS the interval.
+
+    Sleeping the full interval after doing the work makes the real period
+    work+interval: measured 2074ms against a 2000ms target over 291 samples.
+    """
+    left = interval_ms / 1000 - (clock() - started)
+    if left > 0:
+        sleep(left)
+    return max(0.0, left)
+
+
 def grid_rows(groups=GROUPS, per_row=PER_ROW, sep=False):
     """Flatten groups into panel rows, never mixing two groups in one row.
 
@@ -802,6 +814,7 @@ def watch(seconds, interval_ms, log_path=None):
         sys.stdout.flush()
     try:
         while True:
+            tick = time.monotonic()
             s = read_sample(smc, host, bat_cache)
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
@@ -840,7 +853,7 @@ def watch(seconds, interval_ms, log_path=None):
                 sys.stdout.flush()
             if seconds and time.monotonic() - start >= seconds:
                 break
-            time.sleep(interval_ms / 1000)
+            sleep_remainder(tick, interval_ms)
     except KeyboardInterrupt:
         pass
     finally:
@@ -903,6 +916,7 @@ def procs(seconds, interval_ms):
         sys.stdout.flush()
     try:
         while True:
+            tick = time.monotonic()
             s = read_sample(smc, host, bat_cache)
             rows = max(6, shutil.get_terminal_size().lines - 8)
             frame = procs_lines(pm.poll(), s.get("gpu"), s, limit=rows)
@@ -914,7 +928,7 @@ def procs(seconds, interval_ms):
                 sys.stdout.flush()
             if seconds and time.monotonic() - start >= seconds:
                 break
-            time.sleep(interval_ms / 1000)
+            sleep_remainder(tick, interval_ms)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1088,6 +1102,26 @@ def selftest():
     assert len(both2) == 2, f"unterminated final frame lost: got {len(both2)}"
     assert [d["tasks"][0]["pid"] for d in both2] == [1, 2], both2
     assert tail_fr.feed(b"") == [], "already-emitted tail must not repeat"
+
+    # the loop must sleep the REMAINDER of the interval, not the whole thing, or
+    # the real period becomes work+interval (measured 2074ms against a 2000ms
+    # target across 291 samples -- ~22s of skew over a 10 minute run)
+    napped = []
+    assert sleep_remainder(100.0, 2000, clock=lambda: 100.5, sleep=napped.append) == 1.5
+    assert napped == [1.5], napped
+    napped.clear()
+    assert sleep_remainder(100.0, 2000, clock=lambda: 103.0, sleep=napped.append) == 0.0
+    assert napped == [], "work overran the interval -> no sleep, never negative"
+
+    # the default poll period must outlast a slow tick, or the cache is inert:
+    # at -i 2000 a 2s period re-read on every single tick (measured 291/291)
+    ticks, reads = [0.0], []
+    slow = BatteryCache(read=lambda: (reads.append(1), {"battery": {}})[1],
+                        clock=lambda: ticks[0])          # default BATTERY_POLL_S
+    for _ in range(4):
+        slow.get()
+        ticks[0] += 2.0
+    assert len(reads) < 4, f"default poll inert at a 2s tick: {len(reads)}/4 re-reads"
 
     # stream driver: newest frame wins, and a tick with no new data keeps the
     # previous one rather than blanking the table
