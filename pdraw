@@ -281,7 +281,11 @@ class PlistFrames:
 # Arrow keys arrive as ESC [ A/B, and one read can carry several keypresses, so
 # the buffer is consumed as a sequence rather than a single character.
 _KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
-         " ": "pgdn", "b": "pgup"}
+         " ": "pgdn", "b": "pgup", "r": "reverse",
+         "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem",
+         "p": "sort_pid", "n": "sort_name"}
+SORT_KEYS = {"sort_cpu": "cpu_ms_s", "sort_energy": "energy", "sort_mem": "rss_mb",
+             "sort_pid": "pid", "sort_name": "name"}
 _ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
 
 
@@ -333,13 +337,28 @@ class KeyReader:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
-def sudo_prime():
-    """Prompt for the password once on the real tty, then confirm it cached.
+def sudo_passwordless(argv):
+    """True if this exact command may run as root with no prompt.
 
-    Without this the streaming child needs an inherited stderr so sudo can
-    prompt -- which also lets powermetrics' own `proc_pidpath ... failed`
-    warnings onto the screen and into the alt-screen buffer.
+    `sudo -n -l CMD ARGS...` asks that question without ever prompting, so it
+    is safe to call before deciding whether to bother the user at all.
     """
+    return subprocess.run(["sudo", "-n", "-l", *argv],
+                          capture_output=True).returncode == 0
+
+
+def sudo_prime(argv):
+    """Ensure we can run `argv` as root. Returns True if stderr can be silenced.
+
+    Prompts only when it must: a NOPASSWD sudoers rule or a still-valid cached
+    credential means `pdraw procs` starts without interrupting anyone. When a
+    prompt IS needed it happens here, on the real tty, before the alt-screen --
+    and silencing the child's stderr afterwards is what keeps powermetrics'
+    `proc_pidpath ... failed` chatter off the display.
+    """
+    if sudo_passwordless(argv):
+        return True
+    print("pdraw: per-process energy needs powermetrics as root; sudo may prompt.")
     subprocess.run(["sudo", "-v"])          # inherits the tty; prompts if needed
     return subprocess.run(["sudo", "-n", "true"],
                           capture_output=True).returncode == 0
@@ -353,16 +372,24 @@ class PowerMetrics:
     re-run each tick. stdin/stderr are inherited so sudo can prompt on the tty.
     """
 
+    # Fixed, fully-literal argv: a NOPASSWD sudoers rule can then pin every
+    # argument, which matters because `powermetrics -o FILE` writes as root and
+    # an unpinned rule would be a privilege-escalation hole.
+    BIN = "/usr/bin/powermetrics"
     ARGS = ("--samplers", "tasks", "--show-process-energy",
-            "-f", "plist", "-b", "1", "-n", "-1")
+            "-f", "plist", "-b", "1", "-n", "-1", "-i", "1000")
 
-    def __init__(self, interval_ms=1000, stream=None, quiet=True):
+    @classmethod
+    def argv(cls):
+        return [cls.BIN, *cls.ARGS]
+
+    def __init__(self, stream=None, quiet=True):
         self._frames, self.latest, self.proc = PlistFrames(), None, None
         if stream is not None:          # injected by tests; no child, no sudo
             self._fd = stream
             return
         self.proc = subprocess.Popen(
-            ["sudo", "powermetrics", *self.ARGS, "-i", str(interval_ms)],
+            ["sudo", *self.argv()],
             stdout=subprocess.PIPE,
             # quiet only once the credential is cached, else a prompt would be
             # invisible; powermetrics chatters on stderr the whole run otherwise
@@ -399,27 +426,45 @@ class PowerMetrics:
         return left or None
 
 
-def _mem_cell(mb):
-    """Memory as a fixed-width cell. None -> em dash: we could not read it, which
-    is not the same as zero, and a 0 would quietly libel an innocent process."""
-    if mb is None:
-        return "—"
-    return f"{mb / 1024:.1f}G" if mb >= 1024 else f"{mb:.0f}M"
+# Column set: (header, width, row key, formatter). Units live in the header so
+# they are stated once instead of repeated on every row.
+_COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
+         ("PROCESS", 0, "name", None),                       # 0 = the flex column
+         ("CPU ms/s", 10, "cpu_ms_s", lambda v: f"{v:.1f}"),
+         ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"),
+         ("MEM MB", 9, "rss_mb", lambda v: f"{v:.0f}"))
 
 
-def proc_table(rows, name_w=26):
-    """Energy-ranked process table: header, rule, one line per process."""
-    head = (f"     {'PID':>7}  {'PROCESS':<{name_w}}{'CPU ms/s':>10}"
-            f"{'ENERGY/s':>10}{'MEM':>8}")
+def sort_rows(rows, key="energy", reverse=True):
+    """Sort by any column. Rows whose value is unreadable always sort last,
+    in both directions -- an unknown is not a small value."""
+    known = [r for r in rows if r.get(key) is not None]
+    unknown = [r for r in rows if r.get(key) is None]
+    if key == "name":
+        known.sort(key=lambda r: r["name"].lower(), reverse=reverse)
+    else:
+        known.sort(key=lambda r: r[key], reverse=reverse)
+    return known + unknown
+
+
+def proc_table(rows, sort_key="energy", reverse=True, name_w=26):
+    """Process table. The active sort column is marked so the view says how it
+    is ordered rather than leaving the reader to guess."""
+    mark = "▼" if reverse else "▲"
+    widths = [w or name_w for _, w, _, _ in _COLS]
+    heads = [lbl + (mark if key == sort_key else "") for lbl, _, key, _ in _COLS]
+    head = (f"     {heads[0]:>{widths[0]}}  {heads[1]:<{widths[1]}}"
+            + "".join(f"{h:>{w}}" for h, w in zip(heads[2:], widths[2:])))
     out = [head, "     " + "─" * (len(head) - 5)]
     for r in rows:
-        out.append(f"     {r['pid']:>7}  {r['name'][:name_w]:<{name_w}}"
-                   f"{r['cpu_ms_s']:>10.1f}{r['energy']:>10.1f}"
-                   f"{_mem_cell(r['rss_mb']):>8}")
+        tail = "".join(f"{('—' if r.get(k) is None else fmt(r[k])):>{w}}"
+                       for (_, _, k, fmt), w in zip(_COLS[2:], widths[2:]))
+        out.append(f"     {r['pid']:>{widths[0]}}  "
+                   f"{r['name'][:name_w]:<{widths[1]}}" + tail)
     return out
 
 
-def rank_tasks(frame, limit=12, rss=None):
+def rank_tasks(frame, limit=12, rss=None, sort_key="energy", reverse=True):
     """Top tasks from one powermetrics frame, ranked by energy impact.
 
     Energy, not CPU: low CPU is the *absence* of a signal, so it cannot tell an
@@ -439,7 +484,7 @@ def rank_tasks(frame, limit=12, rss=None):
                      "cpu_ms_s": t.get("cputime_ms_per_s", 0.0),
                      "energy": t.get("energy_impact_per_s", t.get("energy_impact", 0.0)),
                      "rss_mb": rss(pid)})
-    rows.sort(key=lambda r: -r["energy"])
+    rows = sort_rows(rows, sort_key, reverse)
     return rows[:limit] if limit else rows
 
 
@@ -945,7 +990,7 @@ def watch(seconds, interval_ms, log_path=None):
 
 
 # ── procs: per-process view (opt-in, the only path that uses sudo) ──────────────
-def procs_lines(pm_frame, gpu, s, view=12, off=0):
+def procs_lines(pm_frame, gpu, s, view=12, off=0, sort_key="energy", reverse=True):
     """Header of global state, then a scrollable window into the ranked table."""
     bits = []
     if gpu:
@@ -954,11 +999,12 @@ def procs_lines(pm_frame, gpu, s, view=12, off=0):
     head = ["", f"  {c('32', '●')}  " + " · ".join(bits), ""]
     if not pm_frame:
         return head + ["     waiting for the first powermetrics sample…"]
-    rows = rank_tasks(pm_frame, limit=None)
+    rows = rank_tasks(pm_frame, limit=None, sort_key=sort_key, reverse=reverse)
     window = rows[off:off + view]
     shown = f"{off + 1}-{off + len(window)} of {len(rows)}" if window else "none"
-    nav = " · ↑↓/jk scroll · g/G ends · q quit" if len(rows) > view else " · q quit"
-    return head + proc_table(window) + ["     " + c("90", shown + nav)]
+    nav = " · jk/↑↓ scroll · c/e/m/p/n sort · r reverse · q quit"
+    return (head + proc_table(window, sort_key, reverse)
+            + ["     " + c("90", shown + nav)])
 
 
 def procs(seconds, interval_ms):
@@ -978,11 +1024,10 @@ def procs(seconds, interval_ms):
     host, bat_cache = host_or_none(), BatteryCache()
     # Prime sudo BEFORE the alt-screen: the prompt must land on the real screen,
     # and caching the credential lets the child's noisy stderr be silenced.
-    print("pdraw: per-process energy needs powermetrics as root; sudo may prompt.")
-    cached = sudo_prime()
-    if not cached:
+    quiet = sudo_prime(PowerMetrics.argv())
+    if not quiet:
         print("pdraw: sudo credential not cached — powermetrics warnings will show.")
-    pm = PowerMetrics(interval_ms, quiet=cached)
+    pm = PowerMetrics(quiet=quiet)
     give_up = time.monotonic() + 60
     while pm.poll() is None and time.monotonic() < give_up:
         if pm.proc and pm.proc.poll() is not None:
@@ -994,12 +1039,14 @@ def procs(seconds, interval_ms):
 
     keys = None
     off, start, frame, done = 0, time.monotonic(), [], False
+    sort_key, reverse = "energy", True
 
     def view_rows():
         return max(3, shutil.get_terminal_size().lines - 10)
 
     def render(pm_frame, sample):
-        out = procs_lines(pm_frame, sample.get("gpu"), sample, view_rows(), off)
+        out = procs_lines(pm_frame, sample.get("gpu"), sample, view_rows(), off,
+                          sort_key, reverse)
         note = (f"     energy ranks · no per-process GPU on Apple Silicon · "
                 f"{time.strftime('%H:%M:%S')}")
         out += ["", c("90", note)]
@@ -1033,7 +1080,13 @@ def procs(seconds, interval_ms):
                         break
                     if acts:
                         for a in acts:
-                            off = scroll_clamp(off, a, total, view_rows())
+                            if a == "reverse":
+                                reverse = not reverse
+                            elif a in SORT_KEYS:
+                                sort_key = SORT_KEYS[a]
+                                off = 0     # a new ordering starts at its top
+                            else:
+                                off = scroll_clamp(off, a, total, view_rows())
                         frame = render(pm_frame, sample)
                 if seconds and time.monotonic() - start >= seconds:
                     done = True
@@ -1162,7 +1215,9 @@ def selftest():
     assert "ON BATTERY" in group_caption("energy", onbat), group_caption("energy", onbat)
     assert group_caption("gpu", rich) is None      # nothing group-scoped to show
 
-    # process table: unreadable memory renders as a dash, never a misleading 0
+    # units belong in the header, not repeated per row; and IMPACT is Apple's
+    # unitless Energy Impact score -- NOT watts (measured: task impacts sum to
+    # 464-2223 while the machine drew 20-40 W, and impact/cpu varies 36x)
     trows = [{"pid": 11, "name": "python3.12", "cpu_ms_s": 142.3, "energy": 88.4,
               "rss_mb": 8600.0},
              {"pid": 1258, "name": "WindowServer", "cpu_ms_s": 9.9, "energy": 3.1,
@@ -1170,13 +1225,35 @@ def selftest():
              {"pid": 987, "name": "distnoted", "cpu_ms_s": 0.4, "energy": 0.1,
               "rss_mb": 1.5}]
     tbl = proc_table(trows)
-    assert any("PID" in l and "ENERGY" in l and "MEM" in l for l in tbl), tbl
-    assert "8.4G" in next(l for l in tbl if "python3.12" in l)      # MB rendered as GB
-    assert "2M" in next(l for l in tbl if "distnoted" in l)         # small stays MB
-    assert "—" in next(l for l in tbl if "WindowServer" in l)       # unknown, not 0
     hdr = next(l for l in tbl if "PID" in l)
-    assert all(len(l) == len(hdr) for l in tbl if l.strip() and "─" not in l), \
-        [len(l) for l in tbl]                                     # columns aligned
+    assert "IMPACT/s" in hdr and "MEM MB" in hdr and "CPU ms/s" in hdr, hdr
+    assert "ENERGY" not in hdr, "ENERGY reads as watts; it is a unitless score"
+    body = next(l for l in tbl if "python3.12" in l)
+    assert "8600" in body and "G" not in body, body      # bare number, unit in header
+    assert "—" in next(l for l in tbl if "WindowServer" in l)
+    assert all(len(l) == len(hdr) for l in tbl if l.strip() and "─" not in l)
+
+    # sorting: any column, either direction, unknowns always last
+    by_cpu = sort_rows(trows, "cpu_ms_s")
+    assert [r["pid"] for r in by_cpu] == [11, 1258, 987], by_cpu
+    assert [r["pid"] for r in sort_rows(trows, "cpu_ms_s", reverse=False)] == [987, 1258, 11]
+    by_mem = sort_rows(trows, "rss_mb")
+    assert [r["pid"] for r in by_mem] == [11, 987, 1258], "unknown memory sorts last"
+    assert [r["pid"] for r in sort_rows(trows, "rss_mb", reverse=False)] == [987, 11, 1258], \
+        "unknown stays last even ascending"
+    assert sort_rows(trows, "name", reverse=False)[0]["name"] == "distnoted"
+
+    # the active sort column is marked, so the view is self-describing
+    marked = next(l for l in proc_table(trows, sort_key="cpu_ms_s") if "PID" in l)
+    assert "▼" in marked and marked.index("▼") > marked.index("CPU"), marked
+    up = next(l for l in proc_table(trows, sort_key="cpu_ms_s", reverse=False) if "PID" in l)
+    assert "▲" in up, up
+
+    # sort keys reach parse_keys
+    assert parse_keys("c") == ["sort_cpu"]
+    assert parse_keys("e") == ["sort_energy"]
+    assert parse_keys("m") == ["sort_mem"]
+    assert parse_keys("r") == ["reverse"]
 
     # tasks ranked by energy (CPU% cannot discriminate: an idle audio daemon and a
     # GPU-bound job both show low CPU). Synthetic aggregate rows must be dropped --
