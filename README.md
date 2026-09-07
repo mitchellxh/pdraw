@@ -16,7 +16,8 @@ adapter detail come from `ioreg`.
 ```
 pdraw              # live grouped plot, 2 wide: energy (draw / charger /
                    # compute / battery), gpu (util / memory), system
-                   # (cpu / ram); each boxed; Ctrl-C to stop
+                   # (cpu / ram). Groups are split by a blank line, the
+                   # same divider the snapshot uses; Ctrl-C to stop
 pdraw -w SECS      # watch for SECS then stop
 pdraw --log FILE   # watch and append each sample as JSONL to FILE
 pdraw -i 250       # sample interval in ms (default 500)

@@ -526,10 +526,18 @@ PER_ROW = 2          # always 2 wide: keeps charts readable at any terminal size
 COMPACT_H = 2        # one deliberate density step, not a gradual squeeze
 
 
-def grid_rows(groups=GROUPS, per_row=PER_ROW):
-    """Flatten groups into panel rows, never mixing two groups in one row."""
-    return [list(lanes[i:i + per_row])
-            for _, lanes in groups for i in range(0, len(lanes), per_row)]
+def grid_rows(groups=GROUPS, per_row=PER_ROW, sep=False):
+    """Flatten groups into panel rows, never mixing two groups in one row.
+
+    sep=True inserts None between groups, rendered as a blank line — the same
+    device the snapshot uses to separate its watt ledger from the gpu/cpu rows.
+    """
+    rows = []
+    for _, lanes in groups:
+        if sep and rows:
+            rows.append(None)
+        rows += [list(lanes[i:i + per_row]) for i in range(0, len(lanes), per_row)]
+    return rows
 
 
 def lane_panel(lane, vals, width, height, rated, total_gb):
@@ -543,10 +551,14 @@ def lane_panel(lane, vals, width, height, rated, total_gb):
                  ref=ref, height=height)
 
 
-def panel_geom(cols, lines, n_rows, per_row=PER_ROW):
-    """(chart width, chart height). Width generalizes today's (cols - 2*9)//2."""
+def panel_geom(cols, lines, n_rows, per_row=PER_ROW, separators=0):
+    """(chart width, chart height). Width generalizes today's (cols - 2*9)//2.
+
+    `separators` are blank lines between groups; they spend height too, so the
+    compact step has to account for them or it trips at the wrong terminal size.
+    """
     width = max(24, min(80, (cols - 9 * per_row) // per_row))
-    full = n_rows * (PANEL_H + 2) + 1 <= lines
+    full = n_rows * (PANEL_H + 2) + separators + 1 <= lines
     return width, (PANEL_H if full else COMPACT_H)
 
 
@@ -558,7 +570,10 @@ def watch(seconds, interval_ms, log_path=None):
     logf = open(log_path, "a") if log_path else None  # JSONL, one sample per line
     host = host_or_none()
     term = shutil.get_terminal_size()
-    width, panel_h = panel_geom(term.columns, term.lines, len(grid_rows()))
+    _rows = grid_rows(sep=True)
+    width, panel_h = panel_geom(term.columns, term.lines,
+                                len(_rows) - _rows.count(None),
+                                separators=_rows.count(None))
     hist = {k: deque(maxlen=width * 2) for k in LANES}
     start, frame = time.monotonic(), []
 
@@ -576,9 +591,11 @@ def watch(seconds, interval_ms, log_path=None):
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
             # groups absent from this sample are dropped, never drawn empty
-            rows = grid_rows(active_groups(s))
+            rows = grid_rows(active_groups(s), sep=True)
+            n_sep = rows.count(None)
             term = shutil.get_terminal_size()
-            w, panel_h = panel_geom(term.columns, term.lines, len(rows))
+            w, panel_h = panel_geom(term.columns, term.lines, len(rows) - n_sep,
+                                    separators=n_sep)
             if w != width:  # terminal resized: re-flow panels, re-cap history to fit
                 width = w   # deque(old, maxlen=n) keeps the most recent n samples
                 hist = {k: deque(hist[k], maxlen=width * 2) for k in LANES}
@@ -589,6 +606,9 @@ def watch(seconds, interval_ms, log_path=None):
             total_gb = host.total_gb if host else 0.0
             frame = []
             for row in rows:
+                if row is None:
+                    frame.append("")          # blank line divides the groups
+                    continue
                 frame += side_by_side(*(lane_panel(k, hist[k], width, panel_h,
                                                    rated, total_gb) for k in row))
             status = f"rated {rated}W ┄" if rated else "ON BATTERY"
@@ -654,6 +674,14 @@ def selftest():
     assert grid_rows((("a", ("x",)), ("b", ("y",)))) == [["x"], ["y"]]
     assert grid_rows(GROUPS) == [["draw", "charger"], ["compute", "battery"],
                                  ["gpu", "gpu_mem"], ["cpu", "ram"]]
+    # groups separated by a blank line — the same device the snapshot uses
+    sep_rows = grid_rows(GROUPS, sep=True)
+    assert sep_rows.count(None) == 2, sep_rows           # 3 groups -> 2 separators
+    assert sep_rows[2] is None and sep_rows[4] is None, sep_rows
+    assert [r for r in sep_rows if r] == grid_rows(GROUPS)  # same rows, same order
+    # separators must count against the height budget or compact trips too late
+    assert panel_geom(100, 31, n_rows=4, separators=2)[1] == PANEL_H
+    assert panel_geom(100, 30, n_rows=4, separators=2)[1] == COMPACT_H
     # today's 2-wide width formula is preserved exactly at 100 cols
     assert panel_geom(100, 40, n_rows=2)[0] == 41, panel_geom(100, 40, n_rows=2)
     assert panel_geom(100, 40, n_rows=4)[1] == PANEL_H     # 4 rows fit 40 lines
