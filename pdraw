@@ -248,19 +248,81 @@ class PlistFrames:
         self._buf = b""
         self.dropped = 0        # corrupt frames seen; surfaced rather than hidden
 
+    _END = b"</plist>"
+
     def feed(self, chunk):
         """Parsed dicts for every frame this chunk completed (possibly none)."""
         self._buf += chunk
         out = []
         while b"\x00" in self._buf:
             raw, self._buf = self._buf.split(b"\x00", 1)
-            if not raw.strip():
-                continue
-            try:
-                out.append(plistlib.loads(raw))
-            except (plistlib.InvalidFileException, ExpatError):
-                self.dropped += 1   # narrow: a bug in our own code still surfaces
+            self._emit(raw, out)
+        # powermetrics writes no NUL after its final frame, so a NUL-only reader
+        # loses it (verified against a captured fixture: 1 of 2 frames emitted).
+        # A buffered tail closed by </plist> is complete — take it now.
+        if self._buf.rstrip().endswith(self._END):
+            self._emit(self._buf, out)
+            self._buf = b""
         return out
+
+    def _emit(self, raw, out):
+        if not raw.strip():
+            return
+        try:
+            out.append(plistlib.loads(raw))
+        except (plistlib.InvalidFileException, ExpatError):
+            self.dropped += 1   # narrow: a bug in our own code still surfaces
+
+
+class PowerMetrics:
+    """Long-lived `sudo powermetrics` stream — one child, no per-tick fork.
+
+    powermetrics costs real CPU while sampling (measured ~66 ms/s of CPU in its
+    own task list), so it is spawned once and read incrementally rather than
+    re-run each tick. stdin/stderr are inherited so sudo can prompt on the tty.
+    """
+
+    ARGS = ("--samplers", "tasks", "--show-process-energy",
+            "-f", "plist", "-b", "1", "-n", "-1")
+
+    def __init__(self, interval_ms=1000, stream=None):
+        self._frames, self.latest, self.proc = PlistFrames(), None, None
+        if stream is not None:          # injected by tests; no child, no sudo
+            self._fd = stream
+            return
+        self.proc = subprocess.Popen(
+            ["sudo", "powermetrics", *self.ARGS, "-i", str(interval_ms)],
+            stdout=subprocess.PIPE)     # stderr/stdin inherited: sudo needs the tty
+        self._fd = self.proc.stdout
+        os.set_blocking(self._fd.fileno(), False)   # never stall the render loop
+
+    def poll(self):
+        """Newest complete frame; the previous one if this tick brought none."""
+        try:
+            chunk = self._fd.read()
+        except (BlockingIOError, ValueError):
+            chunk = None
+        for frame in self._frames.feed(chunk or b""):
+            self.latest = frame         # a live view only wants the newest
+        return self.latest
+
+    def close(self):
+        """Stop the child. Returns surviving pids, or None if it went cleanly.
+
+        powermetrics documents SIGTERM as "stop sampling and exit". It runs as
+        root via sudo, so if it outlives us we cannot kill it ourselves — report
+        the survivors instead of leaving them sampling silently.
+        """
+        if not self.proc:
+            return None
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        left = subprocess.run(["pgrep", "-x", "powermetrics"],
+                              capture_output=True, text=True).stdout.split()
+        return left or None
 
 
 def _mem_cell(mb):
@@ -768,8 +830,10 @@ def watch(seconds, interval_ms, log_path=None):
                                                        rated, total_gb) for k in row))
                 if caps[name]:                # group-scoped state, under its band
                     frame.append(caps[name])
-            frame += [f" {len(hist['draw'])} samples @ {interval_ms}ms · "
-                      f"{time.strftime('%H:%M:%S')}"]  # frame-scoped: shared by all
+            # frame-scoped state: every facet shares one cadence and one clock
+            foot = (f" {len(hist['draw'])} samples @ {interval_ms}ms · "
+                    f"{time.strftime('%H:%M:%S')}")
+            frame.append(foot)
             if TTY:  # redraw from home + clear-to-end: resilient to resize/clear,
                 sys.stdout.write(  # no prev_lines bookkeeping to drift out of sync
                     "\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
@@ -791,6 +855,78 @@ def watch(seconds, interval_ms, log_path=None):
             n = len(hist["draw"])
             print(f"— {n} samples · draw avg {sum(hist['draw'])/n:.1f}W · "
                   f"battery net {sum(hist['battery'])/len(hist['battery']):+.1f}W")
+
+
+# ── procs: per-process view (opt-in, the only path that uses sudo) ──────────────
+def procs_lines(pm_frame, gpu, s, limit=12):
+    """Header of global state, then the energy-ranked table."""
+    bits = []
+    if gpu:
+        bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gpu['mem_inuse_gb']:.1f} GB"]
+    bits.append(f"{s['sys_power_w']:.0f} W draw")
+    head = [""] + [f"  {c('32', '●')}  " + " · ".join(bits), ""]
+    if not pm_frame:
+        return head + ["     waiting for the first powermetrics sample…"]
+    return head + proc_table(rank_tasks(pm_frame, limit=limit))
+
+
+def procs(seconds, interval_ms):
+    """Live per-process view. No per-process GPU exists on Apple Silicon, so the
+    ranking is by energy — the only positive signal that moves when work leaves
+    the CPU. See README for why CPU% cannot answer that question."""
+    if not shutil.which("powermetrics"):
+        sys.exit("pdraw: powermetrics not found (it ships with macOS)")
+    try:
+        smc = SMC()
+    except OSError as e:
+        sys.exit(f"pdraw: cannot read power — {e}")
+    interval_ms = max(interval_ms, 1000)   # powermetrics is costly; don't hammer it
+    host = host_or_none()
+    bat_cache = BatteryCache()
+    # Spawn BEFORE the alt-screen: sudo prompts on the normal screen, and a
+    # password prompt painted into an alternate buffer is invisible.
+    print("pdraw: per-process energy needs powermetrics as root; sudo may prompt.")
+    pm = PowerMetrics(interval_ms)
+    deadline = time.monotonic() + 60
+    while pm.poll() is None and time.monotonic() < deadline:
+        if pm.proc and pm.proc.poll() is not None:
+            sys.exit("pdraw: powermetrics exited (sudo declined?)")
+        time.sleep(0.2)
+
+    def _on_term(*_):
+        raise KeyboardInterrupt
+
+    start, frame = time.monotonic(), []
+    if TTY:
+        signal.signal(signal.SIGTERM, _on_term)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+        sys.stdout.flush()
+    try:
+        while True:
+            s = read_sample(smc, host, bat_cache)
+            rows = max(6, shutil.get_terminal_size().lines - 8)
+            frame = procs_lines(pm.poll(), s.get("gpu"), s, limit=rows)
+            note = ("     no per-process GPU on Apple Silicon · energy ranks · "
+                    f"{time.strftime('%H:%M:%S')}")
+            frame += ["", note]
+            if TTY:
+                sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in frame) + "\x1b[J")
+                sys.stdout.flush()
+            if seconds and time.monotonic() - start >= seconds:
+                break
+            time.sleep(interval_ms / 1000)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if TTY:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+        left = pm.close()
+        if left:   # root-owned survivor we cannot kill ourselves — say so
+            print(f"pdraw: powermetrics still running as root (pid {' '.join(left)}); "
+                  f"stop it with: sudo kill {' '.join(left)}")
+    if not TTY and frame:
+        print("\n".join(frame))
 
 
 # ── selftest ─────────────────────────────────────────────────────────────────────
@@ -945,6 +1081,28 @@ def selftest():
     assert fr.feed(f2[10:] + b"\x00")[0]["tasks"][0]["pid"] == 2
     assert fr.feed(b"not a plist\x00") == [], "garbage frame skipped, stream survives"
     assert fr.dropped == 1, fr.dropped   # counted, not silently swallowed
+    # real powermetrics output does NOT put a NUL after its last frame (verified
+    # against a captured fixture), so a NUL-only reader silently loses it
+    tail_fr = PlistFrames()
+    both2 = tail_fr.feed(f1 + b"\x00" + f2)          # note: no trailing NUL
+    assert len(both2) == 2, f"unterminated final frame lost: got {len(both2)}"
+    assert [d["tasks"][0]["pid"] for d in both2] == [1, 2], both2
+    assert tail_fr.feed(b"") == [], "already-emitted tail must not repeat"
+
+    # stream driver: newest frame wins, and a tick with no new data keeps the
+    # previous one rather than blanking the table
+    class _Chunks:
+        def __init__(self, *bufs):
+            self._bufs = list(bufs)
+
+        def read(self):
+            return self._bufs.pop(0) if self._bufs else b""
+
+    pm = PowerMetrics(stream=_Chunks(f1 + b"\x00", f2 + b"\x00", b""))
+    assert pm.poll()["tasks"][0]["pid"] == 1
+    assert pm.poll()["tasks"][0]["pid"] == 2
+    assert pm.poll()["tasks"][0]["pid"] == 2, "no new frame -> hold the last"
+    assert pm.close() is None, "no child was spawned, so nothing to reap"
 
     # per-process RSS via proc_pidinfo: free and fork-less, but readable only for
     # processes we own. Root-owned daemons must report unknown, never a bogus 0.
@@ -992,7 +1150,8 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(prog="pdraw", description=__doc__.splitlines()[0])
-    ap.add_argument("cmd", nargs="?", choices=["top"], help="top: launch the mactop TUI")
+    ap.add_argument("cmd", nargs="?", choices=["top", "procs"],
+                    help="top: launch mactop · procs: per-process energy view (sudo)")
     ap.add_argument("-w", "--watch", nargs="?", const=0, type=float, metavar="SECS",
                     help="watch duration in seconds (default: until Ctrl-C)")
     ap.add_argument("-s", "--snapshot", action="store_true",
@@ -1007,6 +1166,8 @@ def main():
 
     if args.selftest:
         return selftest()
+    if args.cmd == "procs":
+        return procs(args.watch, args.interval)
     if args.cmd == "top":
         if not shutil.which("mactop"):
             sys.exit("pdraw: mactop not installed — brew install mactop")

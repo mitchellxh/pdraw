@@ -24,6 +24,7 @@ pdraw -i 250       # sample interval in ms (default 500)
 pdraw -s           # one-shot snapshot
 pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
+pdraw procs        # per-process energy view (opt-in; uses sudo)
 pdraw top          # run mactop, if installed
 ```
 
@@ -63,6 +64,39 @@ to one line:
 ```
 net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
 ```
+
+## `pdraw procs` — who is using the machine
+
+Bare `pdraw` never uses sudo. `pdraw procs` does, and it is the only path that
+does: per-process energy comes from `powermetrics`, which requires root. It
+spawns one long-lived `powermetrics` and reads its plist stream, rather than
+re-running it each tick.
+
+```
+  ●  GPU 32% · gpu mem 1.9 GB · 20 W draw
+
+         PID  PROCESS                     CPU ms/s   ENERGY     MEM
+     ──────────────────────────────────────────────────────────────
+       54555  gh                             227.8    660.3       —
+       33214  stable                         114.7    326.5    162M
+       67203  Moonlight                      282.9     94.9     73M
+```
+
+**Ranked by energy, not CPU.** Low CPU is the *absence* of a signal: it cannot
+tell an idle daemon from a job that has handed its work to the GPU. Energy rises
+for either. In the sample above `Moonlight` has 2.5x the CPU of `stable` but a
+third of the energy — sorting by CPU would put the wrong process on top.
+
+**There is no per-process GPU column, because macOS does not expose one on Apple
+Silicon.** Verified three ways: `task_for_pid` is denied even for same-user
+processes; `powermetrics` emits no GPU key in plist under any sampler
+combination; and its text-mode `GPU ms/s` column reads `0.00` for every process
+— including `WindowServer` — while the GPU sits at 36%. Global GPU utilization
+in the header is the closest available answer.
+
+`MEM` shows `—` for processes you do not own: `proc_pidinfo` reads all 200/200 of
+your own processes but none belonging to other users, and a `0` there would be a
+lie rather than a gap.
 
 ## Requirements
 
