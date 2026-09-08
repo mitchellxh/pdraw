@@ -1124,6 +1124,8 @@ GROUPS = (("energy", ("draw", "charger", "compute", "battery")),
 LANES = tuple(lane for _, lanes in GROUPS for lane in lanes)
 PER_ROW = 2          # always 2 wide: keeps charts readable at any terminal size
 COMPACT_H = 2        # one deliberate density step, not a gradual squeeze
+STRIP_N = 5          # processes in the default view's band; `pdraw procs` has all
+STRIP_H = STRIP_N + 2                     # header + rows + the blank above it
 
 
 def _chunk(lanes, per_row=PER_ROW):
@@ -1201,11 +1203,13 @@ def watch(seconds, interval_ms, log_path=None):
     logf = open(log_path, "a") if log_path else None  # JSONL, one sample per line
     host = host_or_none()
     bat_cache = BatteryCache()   # the gauge moves every ~35s; don't fork ioreg per tick
+    procs_src = Processes()
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
     _blanks = _rows.count(None)
     width, panel_h = panel_geom(term.columns, term.lines, len(_rows) - _blanks,
-                                extra_lines=_blanks + 2)  # + energy caption + footer
+                                # + energy caption + footer + the process band
+                                extra_lines=_blanks + 2 + STRIP_H)
     hist = {k: deque(maxlen=width * 2) for k in LANES}
     start, frame = time.monotonic(), []
 
@@ -1220,13 +1224,14 @@ def watch(seconds, interval_ms, log_path=None):
         while True:
             tick = time.monotonic()
             s = read_sample(smc, host, bat_cache)
+            prows = procs_src.sample()
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
             groups = active_groups(s)  # absent groups are dropped, never drawn empty
             caps = {n: group_caption(n, s) for n, _ in groups}
             n_rows = sum(len(_chunk(lanes)) for _, lanes in groups)
-            extra = (len(groups) - 1) + sum(1 for v in caps.values() if v) + 1
+            extra = (len(groups) - 1) + sum(1 for v in caps.values() if v) + 1 + STRIP_H
             term = shutil.get_terminal_size()
             w, panel_h = panel_geom(term.columns, term.lines, n_rows,
                                     extra_lines=extra)
@@ -1247,6 +1252,9 @@ def watch(seconds, interval_ms, log_path=None):
                                                        rated, total_gb) for k in row))
                 if caps[name]:                # group-scoped state, under its band
                     frame.append(caps[name])
+            strip = procs_strip(prows, STRIP_N, term.columns)
+            if strip:
+                frame += [""] + strip
             # frame-scoped state: every facet shares one cadence and one clock
             foot = (f" {len(hist['draw'])} samples @ {interval_ms}ms · "
                     f"{time.strftime('%H:%M:%S')}")
@@ -1285,6 +1293,24 @@ def _fit(parts, width):
         if len(" · ".join([*out, part])) + 5 <= width:
             out.append(part)
     return ("     " + " · ".join(out))[:width]
+
+
+def procs_strip(rows, n=5, width=80):
+    """The default view's process band: the busiest few, and nothing else.
+
+    Ranked by whichever of CPU or GPU is higher. Sorting on CPU alone would hide
+    a GPU-bound job sitting at 2% CPU, which is the case this is most useful for.
+    """
+    if not rows:
+        return []
+    top = sorted(rows, key=lambda r: -max(r.get("cpu_pct") or 0, r.get("gpu_pct") or 0))
+    name_w = max(12, min(width - 22, max(len(r["name"]) for r in top[:n]) + 1))
+    out = [c("90", f"     {'BUSIEST':<{name_w}}{'CPU%':>8}{'GPU%':>8}")]
+    for r in top[:n]:
+        cpu = "—" if r.get("cpu_pct") is None else f"{r['cpu_pct']:.1f}"
+        gpu = "—" if r.get("gpu_pct") is None else f"{r['gpu_pct']:.1f}"
+        out.append(f"     {r['name'][:name_w]:<{name_w}}{cpu:>8}{gpu:>8}")
+    return out
 
 
 def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
@@ -1779,6 +1805,20 @@ def selftest():
     assert parse_keys("\x1b[B") == ["down"], parse_keys("\x1b[B")
     assert parse_keys("\x1b[A") == ["up"]
     assert parse_keys("q") == ["quit"]
+    # the default view's strip is deliberately spare: no pid, no borders, no
+    # bars, no memory columns -- `pdraw procs` is there when you want those
+    srows = [{"pid": 1, "name": "busy-cpu", "cpu_pct": 80.0, "gpu_pct": 0.0},
+             {"pid": 2, "name": "busy-gpu", "cpu_pct": 1.0, "gpu_pct": 90.0},
+             {"pid": 3, "name": "idle", "cpu_pct": 0.2, "gpu_pct": 0.0},
+             {"pid": 4, "name": "middling", "cpu_pct": 30.0, "gpu_pct": 5.0}]
+    strip = procs_strip(srows, n=3, width=60)
+    assert len(strip) == 4, strip                    # one header + three rows
+    assert "PID" not in "".join(strip) and "─" not in "".join(strip[1:])
+    # ranked by whichever of cpu/gpu is higher, so a GPU-bound job with almost no
+    # CPU still shows up -- sorting on CPU alone would hide exactly that case
+    assert [l.split()[0] for l in strip[1:]] == ["busy-gpu", "busy-cpu", "middling"], strip
+    assert procs_strip([], n=3, width=60) == [], "nothing to say, say nothing"
+
     # the header must state a system total for every column the table shows per
     # process. CPU and memory were missing while GPU and power were present.
     hsample = {"host": {"cpu_pct": 24.0, "ram_gb": 43.0}, "ram_total_gb": 48.0,

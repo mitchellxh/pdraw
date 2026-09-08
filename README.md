@@ -16,8 +16,9 @@ adapter detail come from `ioreg`.
 ```
 pdraw              # live grouped plot, 2 wide: energy (draw / charger /
                    # compute / battery), gpu (util / memory), system
-                   # (cpu / ram). Groups are split by a blank line, the
-                   # same divider the snapshot uses; Ctrl-C to stop
+                   # (cpu / ram), then the 5 busiest processes. Groups
+                   # are split by a blank line, the same divider the
+                   # snapshot uses; Ctrl-C to stop
 pdraw -w SECS      # watch for SECS then stop
 pdraw --log FILE   # watch and append each sample as JSONL to FILE
 pdraw -i 250       # sample interval in ms (default 500)
@@ -76,6 +77,11 @@ to one line:
 ```
 net drain 8.6 W · 68% · draw 136 W vs charger 132 W (rated 140 W)
 ```
+
+The live view ends with a spare process band — five rows, name and CPU%/GPU%,
+no pid and no borders. It ranks by whichever of CPU or GPU is higher, so a
+GPU-bound job idling at 2% CPU still surfaces; sorting on CPU alone would hide
+exactly the case it is most useful for. `pdraw procs` has the full table.
 
 ## `pdraw procs` — who is using the machine
 
