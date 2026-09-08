@@ -602,27 +602,39 @@ class GpuMemCache:
     that rarely changes.
     """
 
-    def __init__(self, period=5.0, read=None, clock=time.monotonic):
+    def __init__(self, period=5.0, budget=12, read=None, clock=time.monotonic):
         self._read = read or proc_gpu_mem_mb
-        self._clock, self._period = clock, period
+        self._clock, self._period, self._budget = clock, period, budget
         self._val, self._at = {}, {}
 
-    def fill(self, rows):
-        now = self._clock()
-        live = set()
+    def refresh(self, pids):
+        """Re-measure the stalest `budget` of `pids`, then forget the rest.
+
+        Bounded per call because a full sweep of ~68 GPU clients costs ~0.5s,
+        which would stall a frame. Spreading it over several ticks is fine: GPU
+        allocations move far more slowly than the refresh interval.
+        """
+        now, pids = self._clock(), list(pids)
+        due = [p for p in pids if now - self._at.get(p, -1e9) >= self._period]
+        due.sort(key=lambda p: self._at.get(p, -1e9))
+        for pid in due[:self._budget]:
+            self._val[pid], self._at[pid] = self._read(pid), now
+        for gone in set(self._val) - set(pids):      # process exited; do not grow
+            self._val.pop(gone, None)
+            self._at.pop(gone, None)
+
+    def get(self, pid):
+        return self._val.get(pid)
+
+    def apply(self, rows, holders):
+        """Attach GPU memory to rows. A process with no GPU client holds none —
+        that is known without measuring, so it reads 0 rather than unknown."""
         for r in rows:
-            pid = r["pid"]
-            live.add(pid)
-            if now - self._at.get(pid, -1e9) >= self._period:
-                self._val[pid], self._at[pid] = self._read(pid), now
-            mb = self._val.get(pid)
+            mb = self.get(r["pid"]) if r["pid"] in holders else 0.0
             r["gpu_mb"] = mb
             # % of installed RAM, the same denominator as MEM%: unified memory
             # means GPU allocations are system pages, so the two are comparable
             r["gpu_mem_pct"] = None if mb is None else mb / 1024 / INSTALLED_RAM_GB * 100
-        for gone in set(self._val) - live:     # rows scrolled away; do not grow
-            self._val.pop(gone, None)
-            self._at.pop(gone, None)
         return rows
 
 
@@ -729,11 +741,13 @@ class Processes:
 
     def __init__(self):
         self._prev, self._prev_gpu, self._t = {}, {}, time.monotonic()
+        self.gpu_holders = set()
 
     def sample(self):
         now = time.monotonic()
         dt = max(now - self._t, 1e-6)
         gpu_now = gpu_by_pid()
+        self.gpu_holders = set(gpu_now)   # only these can hold GPU-tagged memory
         cur, rows, seen = {}, [], set()
 
         def gpu_pct(pid):
@@ -1274,7 +1288,7 @@ def _fit(parts, width):
 
 
 def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
-                show_energy=False, fill=None, name_w=34):
+                show_energy=False, name_w=34):
     """Header of global state, then a sorted, scrollable window of processes."""
     # One system total per column below, in the same order, so the header reads
     # as the totals row of the table rather than an unrelated status line.
@@ -1297,8 +1311,8 @@ def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
         return head + ["     no readable processes"]
     ordered = sort_rows(rows, sort_key, reverse)
     window = ordered[off:off + view]
-    if fill:
-        fill(window)          # GPU memory is expensive; only measure what shows
+    longest = max((len(r["name"]) for r in window), default=8)
+    name_w = max(12, min(name_w, longest + 1))
     shown = f"{off + 1}-{off + len(window)} of {len(ordered)}" if window else "none"
     # keys listed in COLUMN order, so which key sorts which column is positional
     keys = "c/m/g/v" + ("/e" if show_energy else "") + "/p/n"
@@ -1355,7 +1369,7 @@ def procs(seconds, interval_ms, want_energy=False):
     def render(rows, sample):
         out = procs_lines(rows, sample.get("gpu"), sample, view_rows(), off,
                           sort_key, reverse, show_energy=show_energy,
-                          fill=gpumem.fill, name_w=name_width())
+                          name_w=name_width())
         cols = shutil.get_terminal_size().columns
         note = _fit([time.strftime("%H:%M:%S"),
                      "GPUMEM is user-mapped, it does not sum to the header",
@@ -1380,6 +1394,8 @@ def procs(seconds, interval_ms, want_energy=False):
             tick = time.monotonic()
             sample = read_sample(smc, host, bat_cache)
             rows = source.sample()
+            gpumem.refresh(source.gpu_holders)
+            gpumem.apply(rows, source.gpu_holders)
             if pm:
                 rows = merge_energy(rows, pm.poll())
             frame = render(rows, sample)
@@ -1600,18 +1616,27 @@ def selftest():
     def _fake(pid):
         calls.append(pid)
         return 4.0
-    gm = GpuMemCache(period=5.0, read=_fake, clock=lambda: tick[0])
-    win = [{"pid": 7}, {"pid": 8}]
-    gm.fill(win)
-    assert [r["gpu_mb"] for r in win] == [4.0, 4.0] and len(calls) == 2
+    # Measured for every process that HOLDS a GPU client, not just the rows on
+    # screen: scoping it to the window made sorting by GPUMEM% circular -- the
+    # sort could only ever surface rows it had already measured.
+    gm = GpuMemCache(period=5.0, budget=2, read=_fake, clock=lambda: tick[0])
+    gm.refresh([1, 2, 3, 4, 5])
+    assert len(calls) == 2, f"bounded work per tick, got {len(calls)}"
+    gm.refresh([1, 2, 3, 4, 5])
+    assert len(calls) == 4, "the next tick picks up the stalest"
+    assert set(calls) == {1, 2, 3, 4}, calls
+    tick[0] = 1.0
+    gm.refresh([1, 2, 3, 4, 5])
+    assert len(calls) == 5, "everything measured once before anything twice"
     tick[0] = 2.0
-    gm.fill(win)
-    assert len(calls) == 2, "inside the window, reuse -- this call is expensive"
-    tick[0] = 6.0
-    gm.fill(win)
-    assert len(calls) == 4, "past the window, re-measure"
-    gm.fill([{"pid": 9}])
-    assert calls[-1] == 9, "a newly visible row is measured immediately"
+    gm.refresh([1, 2, 3, 4, 5])
+    assert len(calls) == 5, "all fresh inside the period -- no work"
+    tick[0] = 99.0
+    gm.refresh([1, 2, 3, 4, 5])
+    assert len(calls) == 7, "stale again, still bounded"
+    assert gm.get(1) == 4.0 and gm.get(404) is None
+    gm.refresh([1])                       # 404 is gone; do not grow forever
+    assert 404 not in gm._val
 
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
@@ -1769,6 +1794,15 @@ def selftest():
     # unified memory: gpu mem comes out of the SAME pool, so it carries the same
     # denominator. 12.9 + 30.1 = 43.0, which is what the system reports used.
     assert "30.1/48" in hline, ("gpu mem shares the pool", hline)
+
+    # the name column sizes to the longest name SHOWN, not to the terminal:
+    # padding every row to full width left a gulf before the numbers
+    onerow = [{"pid": 1, "name": "ab", "cpu_pct": 1.0, "gpu_pct": 0.0, "rss_pct": 0.1,
+               "rss_mb": 1.0, "gpu_mem_pct": 0.0, "energy": None}]
+    tight = procs_lines(onerow, None, hsample, view=3, name_w=60)
+    thdr = next(l for l in tight if "PID" in l)
+    assert thdr.index("CPU%") < 34, (thdr.index("CPU%"), thdr)
+
 
     # the footer must not overflow a narrow terminal: keep what fits, drop the
     # rest, most important first (measured: the full note ran 106 cols at 80)
