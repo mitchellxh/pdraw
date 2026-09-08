@@ -2,11 +2,8 @@
 pdraw-*.jsonl
 pdraw-*.err
 logs/
-.claude/logs/
 
-# ProjectGraph (local-only mode)
-index.md
-log.md
-wiki/
-log.archive.md
-.index-queue
+# Agent + tooling artifacts — not part of the tool
+.claude/
+.repoindex/
+docs/superpowers/
