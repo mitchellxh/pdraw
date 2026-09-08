@@ -1272,11 +1272,19 @@ def _fit(parts, width):
 def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
                 show_energy=False, fill=None, name_w=34):
     """Header of global state, then a sorted, scrollable window of processes."""
-    bits = []
+    # One system total per column below, in the same order, so the header reads
+    # as the totals row of the table rather than an unrelated status line.
+    bits, host = [], s.get("host")
+    if host:
+        bits.append(f"CPU {host['cpu_pct']:.0f}%")
+        total = s.get("ram_total_gb") or 0
+        ram = lane_values(s)["ram"]        # GPU-excluded, matching the ram lane
+        bits.append(f"mem {ram:.1f}/{total:.0f} GB" if total else f"mem {ram:.1f} GB")
     if gpu:
         bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gpu['mem_inuse_gb']:.1f} GB"]
     bits.append(f"{s['sys_power_w']:.0f} W draw")
-    head = ["", f"  {c('32', '●')}  " + " · ".join(bits), ""]
+    head = ["", _fit(bits, shutil.get_terminal_size().columns - 1)
+            .replace("     ", f"  {c('32', '●')}  ", 1), ""]
     if not rows:
         return head + ["     no readable processes"]
     ordered = sort_rows(rows, sort_key, reverse)
@@ -1737,6 +1745,19 @@ def selftest():
     assert parse_keys("\x1b[B") == ["down"], parse_keys("\x1b[B")
     assert parse_keys("\x1b[A") == ["up"]
     assert parse_keys("q") == ["quit"]
+    # the header must state a system total for every column the table shows per
+    # process. CPU and memory were missing while GPU and power were present.
+    hsample = {"host": {"cpu_pct": 24.0, "ram_gb": 43.0}, "ram_total_gb": 48.0,
+               "gpu": {"util_pct": 56.0, "mem_inuse_gb": 30.1},
+               "sys_power_w": 32.0, "adapter_power_w": 0.0, "compute_w": 1.0,
+               "battery_flow_w": 0.0}
+    hline = procs_lines([{"pid": 1, "name": "x", "cpu_pct": 1.0, "gpu_pct": 0.0,
+                          "rss_pct": 0.1, "rss_mb": 1.0, "energy": None}],
+                        hsample["gpu"], hsample, view=3)[1]
+    for token in ("CPU 24%", "GPU 56%", "gpu mem 30.1", "32 W"):
+        assert token in hline, (token, hline)
+    assert "12.9" in hline, ("ram must be the GPU-excluded figure", hline)
+
     # the footer must not overflow a narrow terminal: keep what fits, drop the
     # rest, most important first (measured: the full note ran 106 cols at 80)
     assert _fit(["a", "b", "c"], 100).strip() == "a · b · c"
