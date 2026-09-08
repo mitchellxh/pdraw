@@ -1128,6 +1128,18 @@ STRIP_N = 5          # processes in the default view's band; `pdraw procs` has a
 STRIP_H = STRIP_N + 2                     # header + rows + the blank above it
 
 
+def strip_fits(n_rows, base_extra, lines):
+    """True when the process band costs no panel height and still fits.
+
+    It is an extra, not a tenant: if showing it would shrink the panels or run
+    off the screen, it does not appear.
+    """
+    _, bare = panel_geom(80, lines, n_rows, extra_lines=base_extra)
+    _, with_strip = panel_geom(80, lines, n_rows, extra_lines=base_extra + STRIP_H)
+    return (with_strip == bare
+            and n_rows * (with_strip + 2) + base_extra + STRIP_H <= lines)
+
+
 def _chunk(lanes, per_row=PER_ROW):
     """Split one group's lanes into panel rows."""
     return [list(lanes[i:i + per_row]) for i in range(0, len(lanes), per_row)]
@@ -1224,15 +1236,16 @@ def watch(seconds, interval_ms, log_path=None):
         while True:
             tick = time.monotonic()
             s = read_sample(smc, host, bat_cache)
-            prows = procs_src.sample()
             if logf:  # append + flush per line: tail-able live, kill loses at most one line
                 logf.write(json.dumps({**s, "t": time.time()}, separators=(",", ":")) + "\n")
                 logf.flush()
             groups = active_groups(s)  # absent groups are dropped, never drawn empty
             caps = {n: group_caption(n, s) for n, _ in groups}
             n_rows = sum(len(_chunk(lanes)) for _, lanes in groups)
-            extra = (len(groups) - 1) + sum(1 for v in caps.values() if v) + 1 + STRIP_H
+            base_extra = (len(groups) - 1) + sum(1 for v in caps.values() if v) + 1
             term = shutil.get_terminal_size()
+            show_strip = strip_fits(n_rows, base_extra, term.lines)
+            extra = base_extra + (STRIP_H if show_strip else 0)
             w, panel_h = panel_geom(term.columns, term.lines, n_rows,
                                     extra_lines=extra)
             if w != width:  # terminal resized: re-flow panels, re-cap history to fit
@@ -1252,7 +1265,9 @@ def watch(seconds, interval_ms, log_path=None):
                                                        rated, total_gb) for k in row))
                 if caps[name]:                # group-scoped state, under its band
                     frame.append(caps[name])
-            strip = procs_strip(prows, STRIP_N, term.columns)
+            # only pay for the process walk when the band will actually be drawn
+            strip = procs_strip(procs_src.sample(), STRIP_N, term.columns) \
+                if show_strip else []
             if strip:
                 frame += [""] + strip
             # frame-scoped state: every facet shares one cadence and one clock
@@ -1805,6 +1820,16 @@ def selftest():
     assert parse_keys("\x1b[B") == ["down"], parse_keys("\x1b[B")
     assert parse_keys("\x1b[A") == ["up"]
     assert parse_keys("q") == ["quit"]
+    # the process band must never cost panel height: it appears only when the
+    # frame still fits AND the panels stay the size they would have been without
+    # it. Measured before this rule: terminals of 32-38 lines silently dropped
+    # from full to compact panels just to make room.
+    assert strip_fits(n_rows=4, base_extra=4, lines=50) is True
+    assert strip_fits(n_rows=4, base_extra=4, lines=39) is True     # exactly fits
+    assert strip_fits(n_rows=4, base_extra=4, lines=38) is False    # would shrink
+    assert strip_fits(n_rows=4, base_extra=4, lines=32) is False
+    assert strip_fits(n_rows=4, base_extra=4, lines=24) is False    # compact, no room
+
     # the default view's strip is deliberately spare: no pid, no borders, no
     # bars, no memory columns -- `pdraw procs` is there when you want those
     srows = [{"pid": 1, "name": "busy-cpu", "cpu_pct": 80.0, "gpu_pct": 0.0},
