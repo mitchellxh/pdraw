@@ -804,7 +804,13 @@ def lane_values(s):
     if s.get("gpu"):
         v["gpu"], v["gpu_mem"] = s["gpu"]["util_pct"], s["gpu"]["mem_inuse_gb"]
     if s.get("host"):
-        v["cpu"], v["ram"] = s["host"]["cpu_pct"], s["host"]["ram_gb"]
+        v["cpu"] = s["host"]["cpu_pct"]
+        # ram excludes GPU memory so the two lanes are additive, not overlapping.
+        # On unified memory the GPU's wired allocation is most of "used" (70% on
+        # this hardware), owned by no process and released when the GPU is done;
+        # counting it in both made ram a restatement of gpu mem (corr +1.00).
+        gpu_gb = s["gpu"]["mem_inuse_gb"] if s.get("gpu") else 0.0
+        v["ram"] = max(0.0, s["host"]["ram_gb"] - gpu_gb)
     return v
 
 
@@ -909,8 +915,9 @@ def _resource_rows(s):
         rows += [_row("gpu", g["util_pct"], "%", _bar(g["util_pct"] / 100, "32", _BAR_W)),
                  _row("gpu mem", g["mem_inuse_gb"], "GB", gb_bar(g["mem_inuse_gb"], "32"))]
     if h:
+        ram = lane_values(s)["ram"]      # GPU-excluded, matching the live lane
         rows += [_row("cpu", h["cpu_pct"], "%", _bar(h["cpu_pct"] / 100, "34", _BAR_W)),
-                 _row("ram", h["ram_gb"], "GB", gb_bar(h["ram_gb"], "34"))]
+                 _row("ram", ram, "GB", gb_bar(ram, "34"))]
     return rows
 
 
@@ -1383,13 +1390,29 @@ def selftest():
     assert not any("█" in ln for ln in _snapshot_lines(onbat))    # no watt bars off-adapter
     assert "on battery" in _status_line(onbat) and "92m left" in _status_line(onbat)
 
+    # ram EXCLUDES gpu memory, so the two lanes are additive instead of
+    # overlapping. On unified memory the GPU's wired allocation is most of the
+    # raw "used" figure -- 30.1 of 43.0 GB here -- which no process owns and the
+    # GPU will release. Double-counting it made ram a second view of gpu mem;
+    # they correlated at +1.00 across a 10-minute soak.
+    both = {"host": {"ram_gb": 43.0, "cpu_pct": 5.0},
+            "gpu": {"mem_inuse_gb": 30.1, "util_pct": 40.0},
+            "sys_power_w": 1.0, "adapter_power_w": 1.0, "compute_w": 1.0,
+            "battery_flow_w": 0.0}
+    assert abs(lane_values(both)["ram"] - 12.9) < 0.01, lane_values(both)["ram"]
+    nogpu = {k: v for k, v in both.items() if k != "gpu"}
+    assert lane_values(nogpu)["ram"] == 43.0, "no gpu data -> the raw figure stands"
+    odd = {**both, "gpu": {"mem_inuse_gb": 99.0, "util_pct": 0}}
+    assert lane_values(odd)["ram"] == 0.0, "never negative if the sources disagree"
+
     # new lanes resolve from the sample; absent data OMITS the lane rather than
     # reporting 0.0, which would plot a confident flat line that isn't real
     assert "gpu" not in lane_values(fake) and "cpu" not in lane_values(fake)
     rich = {**fake, "gpu": {"util_pct": 40.0, "mem_inuse_gb": 3.0},
             "host": {"cpu_pct": 12.0, "ram_gb": 20.0}}
     lv = lane_values(rich)
-    assert (lv["gpu"], lv["gpu_mem"], lv["cpu"], lv["ram"]) == (40.0, 3.0, 12.0, 20.0), lv
+    # ram is 20.0 raw minus the 3.0 GB the GPU holds -> 17.0
+    assert (lv["gpu"], lv["gpu_mem"], lv["cpu"], lv["ram"]) == (40.0, 3.0, 12.0, 17.0), lv
     assert lv["draw"] == 136.3, lv                       # existing lanes untouched
     assert grid_rows(active_groups(fake)) == [["draw", "charger"], ["compute", "battery"]]
     assert len(grid_rows(active_groups(rich))) == 4      # all three groups present

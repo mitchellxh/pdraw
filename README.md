@@ -55,8 +55,18 @@ Below the blank line sits a second block on **different** denominators — `gpu`
 and `cpu` against 100%, `gpu mem` and `ram` against installed memory. The gap is
 deliberate: those bars are not comparable with the watt bars above them. Bounded
 metrics are never auto-scaled, so a GPU steady at 40% reads as 40% rather than
-filling its panel. Note `gpu mem` is a large *subset* of `ram`, not additive —
-on unified memory, GPU allocations are charged as wired pages.
+filling its panel.
+
+**`ram` excludes GPU memory, so `ram` + `gpu mem` is what the machine is using.**
+On unified memory the GPU's allocation is charged as wired pages, and on this
+hardware that was 30.1 of 43.0 GB — 70% of the raw "used" figure. Reporting the
+raw number made `ram` a second view of `gpu mem` (they correlated at +1.00 over
+a 10-minute soak) and implied the machine was nearly out of memory for
+applications when apps held 12.9 GB and the GPU would release the rest.
+
+Neither figure is attributable per-process: the GPU's share is kernel-side and
+owned by no pid, which is why the sum of `pdraw procs` memory does not approach
+either number.
 
 The gpu and system blocks are omitted entirely when their data is unavailable,
 leaving the original output untouched. Piped or non-interactive, `-s` collapses
