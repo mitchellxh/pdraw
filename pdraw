@@ -286,7 +286,7 @@ _KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
          "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem", "u": "sort_gpu",
          "p": "sort_pid", "n": "sort_name"}
 SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_energy": "energy",
-             "sort_mem": "rss_mb", "sort_pid": "pid", "sort_name": "name"}
+             "sort_mem": "rss_pct", "sort_pid": "pid", "sort_name": "name"}
 _ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
 
 
@@ -434,7 +434,7 @@ _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("CPU%", 8, "cpu_pct", lambda v: f"{v:.1f}"),
          ("GPU%", 8, "gpu_pct", lambda v: f"{v:.1f}"),
          ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"),
-         ("MEM MB", 9, "rss_mb", lambda v: f"{v:.0f}"))
+         ("MEM%", 8, "rss_pct", lambda v: f"{v:.1f}"))
 
 
 def next_sort(key, reverse, action):
@@ -612,6 +612,19 @@ def _gpu_percent(ns, dt):
     return ns / 1e7 / dt if dt > 0 else 0.0
 
 
+def _installed_ram_gb():
+    libc = ctypes.CDLL(ctypes.util.find_library("c"))
+    libc.sysctlbyname.argtypes = [ctypes.c_char_p, ctypes.c_void_p,
+                                  ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                                  ctypes.c_size_t]
+    mem, sz = _U64(), ctypes.c_size_t(8)
+    libc.sysctlbyname(b"hw.memsize", ctypes.byref(mem), ctypes.byref(sz), None, 0)
+    return (mem.value / 2**30) or 1.0
+
+
+INSTALLED_RAM_GB = _installed_ram_gb()
+
+
 def _cpu_percent(ticks, dt, timebase=None):
     """CPU as a percentage of ONE core over `dt` seconds.
 
@@ -662,6 +675,7 @@ class Processes:
                 "cpu_pct": _cpu_percent(ticks - was, dt) if was is not None else 0.0,
                 "gpu_pct": gpu_pct(pid),
                 "rss_mb": info.pti_resident_size / 2**20,
+                "rss_pct": info.pti_resident_size / 2**30 / INSTALLED_RAM_GB * 100,
                 "energy": None,          # only powermetrics-as-root can fill this
             })
         # Processes we cannot read but which hold GPU clients -- WindowServer is
@@ -671,7 +685,8 @@ class Processes:
             if pid in seen:
                 continue
             rows.append({"pid": pid, "name": name, "cpu_pct": None,
-                         "gpu_pct": gpu_pct(pid), "rss_mb": None, "energy": None})
+                         "gpu_pct": gpu_pct(pid), "rss_mb": None, "rss_pct": None,
+                         "energy": None})
         self._prev, self._t = cur, now
         self._prev_gpu = {pid: ns for pid, (_, ns) in gpu_now.items()}
         return rows
@@ -1468,17 +1483,21 @@ def selftest():
     # unitless Energy Impact score -- NOT watts (measured: task impacts sum to
     # 464-2223 while the machine drew 20-40 W, and impact/cpu varies 36x)
     trows = [{"pid": 11, "name": "python3.12", "cpu_pct": 142.3, "energy": 88.4,
-              "rss_mb": 8600.0},
+              "rss_mb": 8600.0, "rss_pct": 17.5},
              {"pid": 1258, "name": "WindowServer", "cpu_pct": 9.9, "energy": 3.1,
-              "rss_mb": None},
+              "rss_mb": None, "rss_pct": None},
              {"pid": 987, "name": "distnoted", "cpu_pct": 0.4, "energy": 0.1,
-              "rss_mb": 1.5}]
+              "rss_mb": 1.5, "rss_pct": 0.0}]
     tbl = proc_table(trows)
     hdr = next(l for l in tbl if "PID" in l)
-    assert "IMPACT/s" in hdr and "MEM MB" in hdr and "CPU%" in hdr, hdr
+    # the TABLE shows memory as % of installed RAM; the ram LANE keeps GB, since
+    # a time-series reads better in absolute units than in percent
+    assert "IMPACT/s" in hdr and "MEM%" in hdr and "CPU%" in hdr, hdr
+    assert "MEM MB" not in hdr, hdr
+    assert INSTALLED_RAM_GB > 0, INSTALLED_RAM_GB
     assert "ENERGY" not in hdr, "ENERGY reads as watts; it is a unitless score"
     body = next(l for l in tbl if "python3.12" in l)
-    assert "8600" in body and "G" not in body, body      # bare number, unit in header
+    assert "17.5" in body, body                          # percent, unit in header
     assert "—" in next(l for l in tbl if "WindowServer" in l)
     assert all(len(l) == len(hdr) for l in tbl if l.strip() and "─" not in l)
 
@@ -1486,9 +1505,9 @@ def selftest():
     by_cpu = sort_rows(trows, "cpu_pct")
     assert [r["pid"] for r in by_cpu] == [11, 1258, 987], by_cpu
     assert [r["pid"] for r in sort_rows(trows, "cpu_pct", reverse=False)] == [987, 1258, 11]
-    by_mem = sort_rows(trows, "rss_mb")
+    by_mem = sort_rows(trows, "rss_pct")
     assert [r["pid"] for r in by_mem] == [11, 987, 1258], "unknown memory sorts last"
-    assert [r["pid"] for r in sort_rows(trows, "rss_mb", reverse=False)] == [987, 11, 1258], \
+    assert [r["pid"] for r in sort_rows(trows, "rss_pct", reverse=False)] == [987, 11, 1258], \
         "unknown stays last even ascending"
     assert sort_rows(trows, "name", reverse=False)[0]["name"] == "distnoted"
 
@@ -1502,7 +1521,7 @@ def selftest():
     assert next_sort("energy", True, "sort_cpu") == ("cpu_pct", True)
     assert next_sort("cpu_pct", True, "sort_cpu") == ("cpu_pct", False)
     assert next_sort("cpu_pct", False, "sort_cpu") == ("cpu_pct", True)
-    assert next_sort("cpu_pct", False, "sort_mem") == ("rss_mb", True)
+    assert next_sort("cpu_pct", False, "sort_mem") == ("rss_pct", True)
 
     # colour must separate the long tail. Process load is heavily skewed -- with
     # ~375 processes almost everything sits under 15% of the max -- so a linear
