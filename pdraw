@@ -1211,7 +1211,7 @@ def panel_geom(cols, lines, n_rows, per_row=PER_ROW, extra_lines=1):
     return width, (PANEL_H if full else COMPACT_H)
 
 
-def watch(seconds, interval_ms, log_path=None):
+def watch(seconds, interval_ms, log_path=None, want_energy=False):
     try:
         smc = SMC()
     except OSError as e:
@@ -1221,6 +1221,12 @@ def watch(seconds, interval_ms, log_path=None):
     bat_cache = BatteryCache()   # the gauge moves every ~35s; don't fork ioreg per tick
     procs_src = Processes()
     strip_gpumem = GpuMemCache()      # only ever asked about the five rows shown
+    # Only ever on an explicit flag. Unlike `pdraw procs`, bare `pdraw` does not
+    # auto-enable this when sudo happens to be cached: it must never spawn a
+    # root child without being asked.
+    pm = None
+    if want_energy and shutil.which("powermetrics"):
+        pm = PowerMetrics(quiet=sudo_prime(PowerMetrics.argv()))
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
     _blanks = _rows.count(None)
@@ -1275,10 +1281,12 @@ def watch(seconds, interval_ms, log_path=None):
                 # it only needs the rows it is about to draw -- five, not ~68
                 strip_gpumem.refresh([r["pid"] for r in top])
                 strip_gpumem.apply(top, procs_src.gpu_holders)
+                if pm:
+                    merge_energy(top, pm.poll())
 
             # only pay for the process walk when the band will actually be drawn
-            strip = procs_strip(procs_src.sample(), STRIP_N, fill=_fill) \
-                if show_strip else []
+            strip = procs_strip(procs_src.sample(), STRIP_N, fill=_fill,
+                                show_energy=pm is not None) if show_strip else []
             if strip:
                 frame += [""] + strip
             # frame-scoped state: every facet shares one cadence and one clock
@@ -1300,6 +1308,10 @@ def watch(seconds, interval_ms, log_path=None):
             sys.stdout.flush()
         if logf:
             logf.close()
+        left = pm.close() if pm else None
+        if left:   # root-owned survivor we cannot kill ourselves — say so
+            print(f"pdraw: powermetrics still running as root (pid {' '.join(left)}); "
+                  f"stop it with: sudo kill {' '.join(left)}")
     if not TTY and frame:  # piped/captured: residue is the point — keep the record
         print("\n".join(frame))
         if hist["draw"]:
@@ -1325,9 +1337,10 @@ STRIP_NAME_W = 24     # fixed: a width that tracked the names reflowed the band
                       # every time the busiest process changed
 STRIP_COLS = (("CPU%", "cpu_pct"), ("MEM%", "rss_pct"),
               ("GPU%", "gpu_pct"), ("GPUMEM%", "gpu_mem_pct"))
+STRIP_ENERGY_COL = ("IMPACT/s", "energy")
 
 
-def procs_strip(rows, n=5, fill=None):
+def procs_strip(rows, n=5, fill=None, show_energy=False):
     """The default view's process band: the busiest few, same columns as `procs`.
 
     Ranked by whichever of CPU or GPU is higher. Sorting on CPU alone would hide
@@ -1339,12 +1352,13 @@ def procs_strip(rows, n=5, fill=None):
                  key=lambda r: -max(r.get("cpu_pct") or 0, r.get("gpu_pct") or 0))[:n]
     if fill:
         fill(top)         # measure GPU memory for these five only, never all 400
-    head = f"     {'BUSIEST':<{STRIP_NAME_W}}" + "".join(f"{h:>9}" for h, _ in STRIP_COLS)
+    cols = STRIP_COLS + ((STRIP_ENERGY_COL,) if show_energy else ())
+    head = f"     {'BUSIEST':<{STRIP_NAME_W}}" + "".join(f"{h:>9}" for h, _ in cols)
     out = [c("90", head)]
     span = max(len(top) - 1, 1)
     for i, r in enumerate(top):
         cells = "".join(f"{('—' if r.get(k) is None else format(r[k], '.1f')):>9}"
-                        for _, k in STRIP_COLS)
+                        for _, k in cols)
         # already ordered by the ranking metric, so position IS the rank: hottest
         # at the top, cooling down the band, same ramp as the procs table
         shade = _heat(1.0 - i / span)
@@ -1883,6 +1897,13 @@ def selftest():
     # same columns as `pdraw procs`, in the same order
     for col in ("CPU%", "MEM%", "GPU%", "GPUMEM%"):
         assert col in tiny[0], (col, tiny[0])
+    # IMPACT only with --energy, exactly as in `pdraw procs`: it is the one
+    # column needing powermetrics as root, and bare `pdraw` spawns no root child
+    assert "IMPACT/s" not in tiny[0], tiny[0]
+    withe = procs_strip([{"pid": 1, "name": "ab", "cpu_pct": 1.0, "gpu_pct": 0.0,
+                          "energy": 5.0}], n=1, show_energy=True)
+    assert "IMPACT/s" in withe[0], withe[0]
+    assert len(withe[0]) > len(tiny[0]), "the column takes room when present"
 
     # the header must state a system total for every column the table shows per
     # process. CPU and memory were missing while GPU and power were present.
@@ -1992,7 +2013,7 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser(prog="pdraw", description=__doc__.splitlines()[0])
     ap.add_argument("cmd", nargs="?", choices=["top", "procs"],
-                    help="top: launch mactop · procs: per-process energy view (sudo)")
+                    help="top: launch mactop · procs: full per-process table")
     ap.add_argument("-w", "--watch", nargs="?", const=0, type=float, metavar="SECS",
                     help="watch duration in seconds (default: until Ctrl-C)")
     ap.add_argument("-s", "--snapshot", action="store_true",
@@ -2003,7 +2024,8 @@ def main():
                     help="sample interval ms (default 500)")
     ap.add_argument("--json", action="store_true", help="print one sample as JSON")
     ap.add_argument("--energy", action="store_true",
-                    help="procs: add Apple's Energy Impact column (needs sudo)")
+                    help="add Apple's Energy Impact column to the process rows "
+                         "(needs sudo; without it pdraw never runs anything as root)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -2028,7 +2050,7 @@ def main():
         else:
             snapshot(sample)
         return
-    return watch(args.watch, args.interval, args.log)
+    return watch(args.watch, args.interval, args.log, args.energy)
 
 
 if __name__ == "__main__":

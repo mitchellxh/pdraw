@@ -27,7 +27,8 @@ pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
 pdraw procs        # per-process CPU% / MEM% / GPU% / GPUMEM (no sudo)
                    #   sort: c cpu · g gpu · m mem · v gpumem · p pid · n name
-pdraw procs --energy  # ...plus Apple's Energy Impact score (uses sudo)
+pdraw --energy     # ...plus Apple's Energy Impact on those rows (uses sudo)
+pdraw procs --energy  # ...same, on the full table
 pdraw top          # run mactop, if installed
 ```
 
