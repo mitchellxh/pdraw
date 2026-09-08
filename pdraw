@@ -281,22 +281,27 @@ class PlistFrames:
 # ── keyboard: navigation for the procs view ─────────────────────────────────────
 # Arrow keys arrive as ESC [ A/B, and one read can carry several keypresses, so
 # the buffer is consumed as a sequence rather than a single character.
-_KEYS = {"q": "quit", "j": "down", "k": "up", "g": "top", "G": "bottom",
-         " ": "pgdn", "b": "pgup", "r": "reverse",
-         "c": "sort_cpu", "e": "sort_energy", "m": "sort_mem", "u": "sort_gpu",
-         "p": "sort_pid", "n": "sort_name"}
+_KEYS = {"q": "quit", "j": "down", "k": "up", " ": "pgdn", "b": "pgup",
+         "r": "reverse", "c": "sort_cpu", "g": "sort_gpu", "e": "sort_energy",
+         "m": "sort_mem", "v": "sort_gpumem", "p": "sort_pid", "n": "sort_name"}
+# CSI sequences, keyed by everything after "ESC [" up to and including the
+# terminator. Home/End have two common encodings; terminals disagree.
+_CSI = {"A": "up", "B": "down", "H": "top", "F": "bottom",
+        "1~": "top", "4~": "bottom", "5~": "pgup", "6~": "pgdn"}
 SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_energy": "energy",
-             "sort_mem": "rss_pct", "sort_pid": "pid", "sort_name": "name"}
-_ARROWS = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
-
+             "sort_mem": "rss_pct", "sort_pid": "pid", "sort_name": "name",
+             "sort_gpumem": "gpu_mb"}
 
 def parse_keys(buf):
     """Actions for a raw key buffer; unknown keys are ignored, never fatal."""
     out, i = [], 0
     while i < len(buf):
         if buf[i] == "\x1b" and buf[i + 1:i + 2] == "[":
-            out.append(_ARROWS.get(buf[i + 2:i + 3]))
-            i += 3
+            j = i + 2                       # scan to the sequence terminator, so a
+            while j < len(buf) and buf[j] not in "~ABCDFH":   # 4-char form like
+                j += 1                      # ESC[5~ is consumed whole
+            out.append(_CSI.get(buf[i + 2:j + 1]))
+            i = j + 1
             continue
         out.append(_KEYS.get(buf[i]))
         i += 1
@@ -432,9 +437,10 @@ class PowerMetrics:
 _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("PROCESS", 0, "name", None),                       # 0 = the flex column
          ("CPU%", 8, "cpu_pct", lambda v: f"{v:.1f}"),
+         ("MEM%", 8, "rss_pct", lambda v: f"{v:.1f}"),
          ("GPU%", 8, "gpu_pct", lambda v: f"{v:.1f}"),
-         ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"),
-         ("MEM%", 8, "rss_pct", lambda v: f"{v:.1f}"))
+         ("GPUMEM", 9, "gpu_mb", lambda v: f"{v:.0f}M"),
+         ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"))
 
 
 def next_sort(key, reverse, action):
@@ -544,6 +550,76 @@ def _task_info(pid):
     size = ctypes.sizeof(_ProcTaskInfo)
     ok = _LIBPROC.proc_pidinfo(pid, _PROC_PIDTASKINFO, 0, ctypes.byref(info), size)
     return info if ok == size else None
+
+
+# GPU memory per process: VM regions carry a purpose tag, and Metal/IOSurface
+# allocations are tagged. This is user-mapped GPU memory only -- most GPU memory
+# is kernel-side driver allocation owned by no process, so these do NOT sum to
+# the global `gpu mem` figure (0.33 GB against 30.09 GB when measured).
+_PROC_PIDREGIONINFO = 7
+_VM_GPU_TAGS = (100, 88)          # VM_MEMORY_IOACCELERATOR, VM_MEMORY_IOSURFACE
+_PAGE_B = 16384
+
+
+class _ProcRegionInfo(ctypes.Structure):
+    _fields_ = ([(n, _U32) for n in ("protection", "max_protection", "inheritance",
+                                     "flags")] +
+                [("offset", _U64)] +
+                [(n, _U32) for n in ("behavior", "user_wired_count", "user_tag",
+                                     "pages_resident", "pages_shared_now_private",
+                                     "pages_swapped_out", "pages_dirtied", "ref_count",
+                                     "shadow_depth", "share_mode",
+                                     "private_pages_resident", "shared_pages_resident",
+                                     "obj_id", "depth")] +
+                [("address", _U64), ("size", _U64)])
+
+
+def proc_gpu_mem_mb(pid, cap=200000):
+    """Resident MB in GPU-tagged VM regions, or None if the process is unreadable.
+
+    Costs one syscall per region -- thousands for a busy process -- so callers
+    must scope this to what is on screen and cache it.
+    """
+    addr, total, seen = 0, 0, 0
+    size = ctypes.sizeof(_ProcRegionInfo)
+    while seen < cap:
+        ri = _ProcRegionInfo()
+        if _LIBPROC.proc_pidinfo(pid, _PROC_PIDREGIONINFO, addr,
+                                 ctypes.byref(ri), size) != size:
+            break
+        seen += 1
+        if ri.user_tag in _VM_GPU_TAGS:
+            total += ri.pages_resident * _PAGE_B
+        addr = ri.address + ri.size
+    return total / 2**20 if seen else None
+
+
+class GpuMemCache:
+    """GPU memory for the rows on screen, re-measured only every `period`.
+
+    GPU allocations move far more slowly than CPU, and measuring costs ~15ms a
+    process, so a per-tick walk would spend a fifth of the frame on a number
+    that rarely changes.
+    """
+
+    def __init__(self, period=5.0, read=None, clock=time.monotonic):
+        self._read = read or proc_gpu_mem_mb
+        self._clock, self._period = clock, period
+        self._val, self._at = {}, {}
+
+    def fill(self, rows):
+        now = self._clock()
+        live = set()
+        for r in rows:
+            pid = r["pid"]
+            live.add(pid)
+            if now - self._at.get(pid, -1e9) >= self._period:
+                self._val[pid], self._at[pid] = self._read(pid), now
+            r["gpu_mb"] = self._val.get(pid)
+        for gone in set(self._val) - live:     # rows scrolled away; do not grow
+            self._val.pop(gone, None)
+            self._at.pop(gone, None)
+        return rows
 
 
 class _MachTimebase(ctypes.Structure):
@@ -1184,8 +1260,17 @@ def watch(seconds, interval_ms, log_path=None):
 # CPU, memory, names and the pid list all come from libproc with no sudo. Only
 # IMPACT needs powermetrics as root, so it is opt-in (--energy) rather than a
 # toll everyone pays: one column's requirement should not be the view's.
+def _fit(parts, width):
+    """Join with separators, keeping only the leading parts that fit `width`."""
+    out = []
+    for part in parts:
+        if len(" · ".join([*out, part])) + 5 <= width:
+            out.append(part)
+    return ("     " + " · ".join(out))[:width]
+
+
 def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
-                show_energy=False):
+                show_energy=False, fill=None, name_w=34):
     """Header of global state, then a sorted, scrollable window of processes."""
     bits = []
     if gpu:
@@ -1196,10 +1281,13 @@ def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
         return head + ["     no readable processes"]
     ordered = sort_rows(rows, sort_key, reverse)
     window = ordered[off:off + view]
+    if fill:
+        fill(window)          # GPU memory is expensive; only measure what shows
     shown = f"{off + 1}-{off + len(window)} of {len(ordered)}" if window else "none"
-    keys = "c/m/p/n" + ("/e" if show_energy else "")
+    keys = "c/g/m/v/p/n" + ("/e" if show_energy else "")
     nav = f" · jk/↑↓ scroll · {keys} sort (again to flip) · q quit"
-    return (head + proc_table(window, sort_key, reverse, show_energy=show_energy)
+    return (head + proc_table(window, sort_key, reverse, name_w=name_w,
+                              show_energy=show_energy)
             + ["     " + c("90", shown + nav)])
 
 
@@ -1215,6 +1303,7 @@ def procs(seconds, interval_ms, want_energy=False):
     except OSError as e:
         sys.exit(f"pdraw: cannot read power — {e}")
     host, bat_cache, source = host_or_none(), BatteryCache(), Processes()
+    gpumem = GpuMemCache()
     pm, quiet = None, True
     have_pm = bool(shutil.which("powermetrics"))
     if want_energy and not have_pm:
@@ -1242,13 +1331,19 @@ def procs(seconds, interval_ms, want_energy=False):
     def view_rows():
         return max(3, shutil.get_terminal_size().lines - 10)
 
+    def name_width():
+        fixed = 5 + 7 + 2 + 8 + 8 + 8 + 9 + (10 if show_energy else 0)
+        return max(12, shutil.get_terminal_size().columns - fixed)
+
     def render(rows, sample):
         out = procs_lines(rows, sample.get("gpu"), sample, view_rows(), off,
-                          sort_key, reverse, show_energy=show_energy)
-        hint = ("IMPACT is a relative score, not watts · " if show_energy
-                else "IMPACT (energy) needs --energy · ")
-        note = (f"     {hint}no per-process GPU on Apple Silicon · "
-                f"{time.strftime('%H:%M:%S')}")
+                          sort_key, reverse, show_energy=show_energy,
+                          fill=gpumem.fill, name_w=name_width())
+        cols = shutil.get_terminal_size().columns
+        note = _fit([time.strftime("%H:%M:%S"),
+                     "GPUMEM is user-mapped, it does not sum to the header",
+                     ("IMPACT is relative, not watts" if show_energy
+                      else "IMPACT needs --energy")], cols)
         out += ["", c("90", note)]
         if TTY:
             sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in out) + "\x1b[J")
@@ -1477,6 +1572,30 @@ def selftest():
     assert abs(_gpu_percent(500_000_000, 2.0) - 25.0) < 0.01
     assert _gpu_percent(0, 1.0) == 0.0
 
+    # per-process GPU memory: VM regions tagged VM_MEMORY_IOACCELERATOR (100) or
+    # IOSURFACE (88). Real and sudo-free, but ~15ms a process (one syscall per
+    # region, no bulk API), so it is measured only for rows on screen and cached.
+    mine = proc_gpu_mem_mb(os.getpid())
+    assert mine is not None and mine >= 0.0, mine
+    assert proc_gpu_mem_mb(1) is None, "root-owned process is unreadable"
+
+    calls, tick = [], [0.0]
+    def _fake(pid):
+        calls.append(pid)
+        return 4.0
+    gm = GpuMemCache(period=5.0, read=_fake, clock=lambda: tick[0])
+    win = [{"pid": 7}, {"pid": 8}]
+    gm.fill(win)
+    assert [r["gpu_mb"] for r in win] == [4.0, 4.0] and len(calls) == 2
+    tick[0] = 2.0
+    gm.fill(win)
+    assert len(calls) == 2, "inside the window, reuse -- this call is expensive"
+    tick[0] = 6.0
+    gm.fill(win)
+    assert len(calls) == 4, "past the window, re-measure"
+    gm.fill([{"pid": 9}])
+    assert calls[-1] == 9, "a newly visible row is measured immediately"
+
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
     src = Processes()
@@ -1564,6 +1683,7 @@ def selftest():
 
     # sort keys reach parse_keys
     assert parse_keys("c") == ["sort_cpu"]
+    assert parse_keys("g") == ["sort_gpu"]
     assert parse_keys("e") == ["sort_energy"]
     assert parse_keys("m") == ["sort_mem"]
     assert parse_keys("r") == ["reverse"]
@@ -1617,7 +1737,21 @@ def selftest():
     assert parse_keys("\x1b[B") == ["down"], parse_keys("\x1b[B")
     assert parse_keys("\x1b[A") == ["up"]
     assert parse_keys("q") == ["quit"]
-    assert parse_keys("gG") == ["top", "bottom"]
+    # the footer must not overflow a narrow terminal: keep what fits, drop the
+    # rest, most important first (measured: the full note ran 106 cols at 80)
+    assert _fit(["a", "b", "c"], 100).strip() == "a · b · c"
+    assert _fit(["aaa", "bbbbbbbbbb"], 12).strip() == "aaa"
+    assert len(_fit(["x" * 200], 40)) <= 40, _fit(["x" * 200], 40)
+
+    # sort keys are mnemonic: c/g/m/e/p/n. Navigation moved to Home/End so that
+    # `g` can mean gpu rather than "go to top".
+    assert parse_keys("g") == ["sort_gpu"]
+    assert parse_keys("\x1b[H") == ["top"] and parse_keys("\x1b[F") == ["bottom"]
+    assert parse_keys("\x1b[1~") == ["top"], parse_keys("\x1b[1~")   # alt encoding
+    assert parse_keys("\x1b[4~") == ["bottom"]
+    # multi-char CSI sequences must be consumed whole, terminator included
+    assert parse_keys("\x1b[5~") == ["pgup"], parse_keys("\x1b[5~")
+    assert parse_keys("\x1b[6~j") == ["pgdn", "down"], parse_keys("\x1b[6~j")
     assert parse_keys("j\x1b[Ak") == ["down", "up", "up"], parse_keys("j\x1b[Ak")
     assert parse_keys("zx") == [], "unknown keys are ignored, not crashes"
     assert parse_keys("") == []

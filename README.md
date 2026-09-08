@@ -24,7 +24,8 @@ pdraw -i 250       # sample interval in ms (default 500)
 pdraw -s           # one-shot snapshot
 pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
-pdraw procs        # per-process CPU / GPU / memory (no sudo)
+pdraw procs        # per-process CPU% / MEM% / GPU% / GPUMEM (no sudo)
+                   #   sort: c cpu · g gpu · m mem · v gpumem · p pid · n name
 pdraw procs --energy  # ...plus Apple's Energy Impact score (uses sudo)
 pdraw top          # run mactop, if installed
 ```
@@ -109,24 +110,20 @@ the obvious places and wrongly conclude it does not exist.
 Processes that hold GPU clients but are not ours to read — `WindowServer` above
 all — are still listed, with `—` for CPU and memory.
 
-### Why there is no per-process VRAM column
+### `GPUMEM` — what it is, and what it is not
 
-Not because the data is unavailable — it is. Walking a process's VM regions with
-`proc_pidinfo(PROC_PIDREGIONINFO)` and summing those tagged
-`VM_MEMORY_IOACCELERATOR` (100) or `VM_MEMORY_IOSURFACE` (88) gives a real
-per-process figure, with no sudo.
+`GPUMEM` sums a process's VM regions tagged `VM_MEMORY_IOACCELERATOR` (100) or
+`VM_MEMORY_IOSURFACE` (88), via `proc_pidinfo(PROC_PIDREGIONINFO)`. No sudo.
 
-It is left out for two measured reasons:
+**It is user-mapped GPU memory only, and does not sum to the header's `gpu mem`.**
+Measured across every process holding GPU clients it came to 0.33 GB while
+`ioreg` reported 30.09 GB in use — 91x apart. Both figures are correct: most GPU
+memory is kernel-side driver allocation, owned by no process. So `GPUMEM` tells
+you which process is holding Metal buffers, not its share of the global figure.
 
-1. **It does not mean what it would appear to mean.** Summed across every
-   process holding GPU clients it came to 0.33 GB while `ioreg` reported 30.09 GB
-   in use — 91x apart. Both are correct; most GPU memory is kernel-side driver
-   allocation that is never mapped into a process. A column reading `152 MB`
-   under a header reading `30.1 GB` invites the inference that it is that
-   process's share of it. It is not, and nothing on screen would say so.
-2. **It costs ~15 ms per process** — one syscall per VM region, no bulk API, and
-   a busy process has thousands of regions. Even limited to the visible rows
-   that is ~150 ms a tick.
+It costs ~15 ms per process (one syscall per VM region, no bulk API, thousands
+of regions for a busy process), so it is measured only for rows on screen and
+cached for 5 s — GPU allocations move slowly. Amortised that is ~6 ms a tick.
 
 The global `gpu mem` figure in the header is verified to track real GPU work: it
 moved 1.8 -> 31.2 GB as utilization went 40% -> 99% while system RAM stayed flat.
