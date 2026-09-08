@@ -241,54 +241,18 @@ def cpu_pct_from_ticks(prev, cur):
 
 
 # ── powermetrics stream: NUL-framed plists ──────────────────────────────────────
-class PlistFrames:
-    """Reassembles a `powermetrics --format plist` byte stream into whole plists.
-
-    Frames are NUL-separated, and a read from a pipe lands wherever it lands, so
-    a frame split mid-XML is routine. Partial tails are held until terminated.
-    """
-
-    def __init__(self):
-        self._buf = b""
-        self.dropped = 0        # corrupt frames seen; surfaced rather than hidden
-
-    _END = b"</plist>"
-
-    def feed(self, chunk):
-        """Parsed dicts for every frame this chunk completed (possibly none)."""
-        self._buf += chunk
-        out = []
-        while b"\x00" in self._buf:
-            raw, self._buf = self._buf.split(b"\x00", 1)
-            self._emit(raw, out)
-        # powermetrics writes no NUL after its final frame, so a NUL-only reader
-        # loses it (verified against a captured fixture: 1 of 2 frames emitted).
-        # A buffered tail closed by </plist> is complete — take it now.
-        if self._buf.rstrip().endswith(self._END):
-            self._emit(self._buf, out)
-            self._buf = b""
-        return out
-
-    def _emit(self, raw, out):
-        if not raw.strip():
-            return
-        try:
-            out.append(plistlib.loads(raw))
-        except (plistlib.InvalidFileException, ExpatError):
-            self.dropped += 1   # narrow: a bug in our own code still surfaces
-
-
 # ── keyboard: navigation for the procs view ─────────────────────────────────────
 # Arrow keys arrive as ESC [ A/B, and one read can carry several keypresses, so
 # the buffer is consumed as a sequence rather than a single character.
 _KEYS = {"q": "quit", "j": "down", "k": "up", " ": "pgdn", "b": "pgup",
          "r": "reverse", "c": "sort_cpu", "g": "sort_gpu", "e": "sort_energy",
-         "m": "sort_mem", "v": "sort_gpumem", "p": "sort_pid", "n": "sort_name"}
+         "m": "sort_mem", "v": "sort_gpumem", "w": "sort_power",
+         "p": "sort_pid", "n": "sort_name"}
 # CSI sequences, keyed by everything after "ESC [" up to and including the
 # terminator. Home/End have two common encodings; terminals disagree.
 _CSI = {"A": "up", "B": "down", "H": "top", "F": "bottom",
         "1~": "top", "4~": "bottom", "5~": "pgup", "6~": "pgdn"}
-SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_energy": "energy",
+SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_power": "power_w",
              "sort_mem": "rss_pct", "sort_pid": "pid", "sort_name": "name",
              "sort_gpumem": "gpu_mem_pct"}
 
@@ -343,95 +307,6 @@ class KeyReader:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
-def sudo_passwordless(argv):
-    """True if this exact command may run as root with no prompt.
-
-    `sudo -n -l CMD ARGS...` asks that question without ever prompting, so it
-    is safe to call before deciding whether to bother the user at all.
-    """
-    return subprocess.run(["sudo", "-n", "-l", *argv],
-                          capture_output=True).returncode == 0
-
-
-def sudo_prime(argv):
-    """Ensure we can run `argv` as root. Returns True if stderr can be silenced.
-
-    Prompts only when it must: a NOPASSWD sudoers rule or a still-valid cached
-    credential means `pdraw procs` starts without interrupting anyone. When a
-    prompt IS needed it happens here, on the real tty, before the alt-screen --
-    and silencing the child's stderr afterwards is what keeps powermetrics'
-    `proc_pidpath ... failed` chatter off the display.
-    """
-    if sudo_passwordless(argv):
-        return True
-    print("pdraw: per-process energy needs powermetrics as root; sudo may prompt.")
-    subprocess.run(["sudo", "-v"])          # inherits the tty; prompts if needed
-    return subprocess.run(["sudo", "-n", "true"],
-                          capture_output=True).returncode == 0
-
-
-class PowerMetrics:
-    """Long-lived `sudo powermetrics` stream — one child, no per-tick fork.
-
-    powermetrics costs real CPU while sampling (measured ~66 ms/s of CPU in its
-    own task list), so it is spawned once and read incrementally rather than
-    re-run each tick. stdin/stderr are inherited so sudo can prompt on the tty.
-    """
-
-    # Fixed, fully-literal argv: a NOPASSWD sudoers rule can then pin every
-    # argument, which matters because `powermetrics -o FILE` writes as root and
-    # an unpinned rule would be a privilege-escalation hole.
-    BIN = "/usr/bin/powermetrics"
-    ARGS = ("--samplers", "tasks", "--show-process-energy",
-            "-f", "plist", "-b", "1", "-n", "-1", "-i", "1000")
-
-    @classmethod
-    def argv(cls):
-        return [cls.BIN, *cls.ARGS]
-
-    def __init__(self, stream=None, quiet=True):
-        self._frames, self.latest, self.proc = PlistFrames(), None, None
-        if stream is not None:          # injected by tests; no child, no sudo
-            self._fd = stream
-            return
-        self.proc = subprocess.Popen(
-            ["sudo", *self.argv()],
-            stdout=subprocess.PIPE,
-            # quiet only once the credential is cached, else a prompt would be
-            # invisible; powermetrics chatters on stderr the whole run otherwise
-            stderr=subprocess.DEVNULL if quiet else None)
-        self._fd = self.proc.stdout
-        os.set_blocking(self._fd.fileno(), False)   # never stall the render loop
-
-    def poll(self):
-        """Newest complete frame; the previous one if this tick brought none."""
-        try:
-            chunk = self._fd.read()
-        except (BlockingIOError, ValueError):
-            chunk = None
-        for frame in self._frames.feed(chunk or b""):
-            self.latest = frame         # a live view only wants the newest
-        return self.latest
-
-    def close(self):
-        """Stop the child. Returns surviving pids, or None if it went cleanly.
-
-        powermetrics documents SIGTERM as "stop sampling and exit". It runs as
-        root via sudo, so if it outlives us we cannot kill it ourselves — report
-        the survivors instead of leaving them sampling silently.
-        """
-        if not self.proc:
-            return None
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        left = subprocess.run(["pgrep", "-x", "powermetrics"],
-                              capture_output=True, text=True).stdout.split()
-        return left or None
-
-
 # Column set: (header, width, row key, formatter). Units live in the header so
 # they are stated once instead of repeated on every row.
 _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
@@ -440,7 +315,7 @@ _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("MEM%", 8, "rss_pct", lambda v: f"{v:.1f}"),
          ("GPU%", 8, "gpu_pct", lambda v: f"{v:.1f}"),
          ("GPUMEM%", 9, "gpu_mem_pct", lambda v: f"{v:.1f}"),
-         ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"))
+         ("POWER W", 9, "power_w", lambda v: f"{v:.2f}"))
 
 
 def next_sort(key, reverse, action):
@@ -460,7 +335,7 @@ def _heat(frac):
     return f"38;5;{_RAMP[min(int(f * len(_RAMP)), len(_RAMP) - 1)]}"
 
 
-def sort_rows(rows, key="energy", reverse=True):
+def sort_rows(rows, key="cpu_pct", reverse=True):
     """Sort by any column. Rows whose value is unreadable always sort last,
     in both directions -- an unknown is not a small value."""
     known = [r for r in rows if r.get(key) is not None]
@@ -472,10 +347,10 @@ def sort_rows(rows, key="energy", reverse=True):
     return known + unknown
 
 
-def proc_table(rows, sort_key="energy", reverse=True, name_w=34, show_energy=True):
+def proc_table(rows, sort_key="cpu_pct", reverse=True, name_w=34):
     """Process table. The active sort column is marked so the view says how it
     is ordered rather than leaving the reader to guess."""
-    cols = [col for col in _COLS if col[2] != "energy" or show_energy]
+    cols = _COLS
     mark = "▼" if reverse else "▲"
     widths = [w or name_w for _, w, _, _ in cols]
     heads = [lbl + (mark if key == sort_key else "") for lbl, _, key, _ in cols]
@@ -642,6 +517,49 @@ class GpuMemCache:
         return rows
 
 
+# Per-process energy. proc_pid_rusage exposes a monotonic nanojoule counter, so
+# a delta over wall time is watts -- an actual physical unit, readable without
+# privileges. It attributes the energy a process CAUSES, so it does not sum to
+# system draw: a large part of that is baseline (display, memory, idle rails)
+# owned by no process. Measured under load it captures ~70% of the marginal
+# power a busy process adds.
+_RUSAGE_INFO_V6 = 6
+_RU6_FIELDS = """ri_user_time ri_system_time ri_pkg_idle_wkups ri_interrupt_wkups
+ri_pageins ri_wired_size ri_resident_size ri_phys_footprint ri_proc_start_abstime
+ri_proc_exit_abstime ri_child_user_time ri_child_system_time ri_child_pkg_idle_wkups
+ri_child_interrupt_wkups ri_child_pageins ri_child_elapsed_abstime ri_diskio_bytesread
+ri_diskio_byteswritten ri_cpu_time_qos_default ri_cpu_time_qos_maintenance
+ri_cpu_time_qos_background ri_cpu_time_qos_utility ri_cpu_time_qos_legacy
+ri_cpu_time_qos_user_initiated ri_cpu_time_qos_user_interactive ri_billed_system_time
+ri_serviced_system_time ri_logical_writes ri_lifetime_max_phys_footprint ri_instructions
+ri_cycles ri_billed_energy ri_serviced_energy ri_interval_max_phys_footprint
+ri_runnable_time ri_flags ri_user_ptime ri_system_ptime ri_pinstructions ri_pcycles
+ri_energy_nj ri_penergy_nj ri_secure_time_in_system ri_secure_ptime_in_system
+ri_neural_footprint ri_lifetime_max_neural_footprint
+ri_interval_max_neural_footprint""".split()
+
+
+class _RusageV6(ctypes.Structure):
+    _fields_ = ([("ri_uuid", ctypes.c_uint8 * 16)] +
+                [(n, _U64) for n in _RU6_FIELDS] + [("ri_reserved", _U64 * 9)])
+
+
+_LIBPROC.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+
+
+def proc_energy_nj(pid):
+    """Cumulative energy in nanojoules, or None when the process isn't ours."""
+    buf = _RusageV6()
+    if _LIBPROC.proc_pid_rusage(pid, _RUSAGE_INFO_V6, ctypes.byref(buf)) != 0:
+        return None
+    return buf.ri_energy_nj
+
+
+def _watts(delta_nj, dt):
+    """Nanojoules over seconds -> watts. Clamped: a counter reset is not power."""
+    return max(0.0, delta_nj) / 1e9 / dt if dt > 0 else 0.0
+
+
 class _MachTimebase(ctypes.Structure):
     _fields_ = [("numer", _U32), ("denom", _U32)]
 
@@ -744,7 +662,8 @@ class Processes:
     """
 
     def __init__(self):
-        self._prev, self._prev_gpu, self._t = {}, {}, time.monotonic()
+        self._prev, self._prev_gpu, self._prev_nj = {}, {}, {}
+        self._t = time.monotonic()
         self.gpu_holders = set()
 
     def sample(self):
@@ -752,7 +671,7 @@ class Processes:
         dt = max(now - self._t, 1e-6)
         gpu_now = gpu_by_pid()
         self.gpu_holders = set(gpu_now)   # only these can hold GPU-tagged memory
-        cur, rows, seen = {}, [], set()
+        cur, cur_nj, rows, seen = {}, {}, [], set()
 
         def gpu_pct(pid):
             was = self._prev_gpu.get(pid)
@@ -767,14 +686,19 @@ class Processes:
             ticks = info.pti_total_user + info.pti_total_system
             cur[pid] = ticks
             was = self._prev.get(pid)
+            nj = proc_energy_nj(pid)
+            was_nj = self._prev_nj.get(pid)
+            if nj is not None:
+                cur_nj[pid] = nj
+            power = _watts(nj - was_nj, dt) if None not in (nj, was_nj) else 0.0
             rows.append({
                 "pid": pid,
                 "name": proc_name(pid) or "?",
                 "cpu_pct": _cpu_percent(ticks - was, dt) if was is not None else 0.0,
                 "gpu_pct": gpu_pct(pid),
+                "power_w": power,
                 "rss_mb": info.pti_resident_size / 2**20,
                 "rss_pct": info.pti_resident_size / 2**30 / INSTALLED_RAM_GB * 100,
-                "energy": None,          # only powermetrics-as-root can fill this
             })
         # Processes we cannot read but which hold GPU clients -- WindowServer is
         # the obvious one. Their GPU time is real and worth showing even though
@@ -784,21 +708,10 @@ class Processes:
                 continue
             rows.append({"pid": pid, "name": name, "cpu_pct": None,
                          "gpu_pct": gpu_pct(pid), "rss_mb": None, "rss_pct": None,
-                         "energy": None})
-        self._prev, self._t = cur, now
+                         "power_w": None})
+        self._prev, self._prev_nj, self._t = cur, cur_nj, now
         self._prev_gpu = {pid: ns for pid, (_, ns) in gpu_now.items()}
         return rows
-
-
-def merge_energy(rows, pm_frame):
-    """Fold powermetrics energy impact into libproc rows, matched on pid."""
-    if not pm_frame:
-        return rows
-    by_pid = {t["pid"]: t.get("energy_impact_per_s", 0.0)
-              for t in (pm_frame.get("tasks") or []) if t.get("pid", -1) >= 0}
-    for r in rows:
-        r["energy"] = by_pid.get(r["pid"])
-    return rows
 
 
 def host_or_none():
@@ -1211,7 +1124,7 @@ def panel_geom(cols, lines, n_rows, per_row=PER_ROW, extra_lines=1):
     return width, (PANEL_H if full else COMPACT_H)
 
 
-def watch(seconds, interval_ms, log_path=None, want_energy=False):
+def watch(seconds, interval_ms, log_path=None):
     try:
         smc = SMC()
     except OSError as e:
@@ -1221,12 +1134,6 @@ def watch(seconds, interval_ms, log_path=None, want_energy=False):
     bat_cache = BatteryCache()   # the gauge moves every ~35s; don't fork ioreg per tick
     procs_src = Processes()
     strip_gpumem = GpuMemCache()      # only ever asked about the five rows shown
-    # Only ever on an explicit flag. Unlike `pdraw procs`, bare `pdraw` does not
-    # auto-enable this when sudo happens to be cached: it must never spawn a
-    # root child without being asked.
-    pm = None
-    if want_energy and shutil.which("powermetrics"):
-        pm = PowerMetrics(quiet=sudo_prime(PowerMetrics.argv()))
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
     _blanks = _rows.count(None)
@@ -1281,12 +1188,10 @@ def watch(seconds, interval_ms, log_path=None, want_energy=False):
                 # it only needs the rows it is about to draw -- five, not ~68
                 strip_gpumem.refresh([r["pid"] for r in top])
                 strip_gpumem.apply(top, procs_src.gpu_holders)
-                if pm:
-                    merge_energy(top, pm.poll())
 
             # only pay for the process walk when the band will actually be drawn
-            strip = procs_strip(procs_src.sample(), STRIP_N, fill=_fill,
-                                show_energy=pm is not None) if show_strip else []
+            strip = procs_strip(procs_src.sample(), STRIP_N,
+                                fill=_fill) if show_strip else []
             if strip:
                 frame += [""] + strip
             # frame-scoped state: every facet shares one cadence and one clock
@@ -1308,10 +1213,6 @@ def watch(seconds, interval_ms, log_path=None, want_energy=False):
             sys.stdout.flush()
         if logf:
             logf.close()
-        left = pm.close() if pm else None
-        if left:   # root-owned survivor we cannot kill ourselves — say so
-            print(f"pdraw: powermetrics still running as root (pid {' '.join(left)}); "
-                  f"stop it with: sudo kill {' '.join(left)}")
     if not TTY and frame:  # piped/captured: residue is the point — keep the record
         print("\n".join(frame))
         if hist["draw"]:
@@ -1321,9 +1222,10 @@ def watch(seconds, interval_ms, log_path=None, want_energy=False):
 
 
 # ── procs: per-process view ─────────────────────────────────────────────────────
-# CPU, memory, names and the pid list all come from libproc with no sudo. Only
-# IMPACT needs powermetrics as root, so it is opt-in (--energy) rather than a
-# toll everyone pays: one column's requirement should not be the view's.
+# Everything here comes from libproc with no privileges: CPU, memory, GPU time,
+# GPU-tagged memory, and power. Power is proc_pid_rusage's nanojoule counter
+# differentiated over wall time -- real watts, where powermetrics' Energy Impact
+# was a unitless composite that needed root and could not be read as a quantity.
 def _fit(parts, width):
     """Join with separators, keeping only the leading parts that fit `width`."""
     out = []
@@ -1335,12 +1237,11 @@ def _fit(parts, width):
 
 STRIP_NAME_W = 24     # fixed: a width that tracked the names reflowed the band
                       # every time the busiest process changed
-STRIP_COLS = (("CPU%", "cpu_pct"), ("MEM%", "rss_pct"),
-              ("GPU%", "gpu_pct"), ("GPUMEM%", "gpu_mem_pct"))
-STRIP_ENERGY_COL = ("IMPACT/s", "energy")
+STRIP_COLS = (("CPU%", "cpu_pct"), ("MEM%", "rss_pct"), ("GPU%", "gpu_pct"),
+              ("GPUMEM%", "gpu_mem_pct"), ("POWER W", "power_w"))
 
 
-def procs_strip(rows, n=5, fill=None, show_energy=False):
+def procs_strip(rows, n=5, fill=None):
     """The default view's process band: the busiest few, same columns as `procs`.
 
     Ranked by whichever of CPU or GPU is higher. Sorting on CPU alone would hide
@@ -1352,7 +1253,7 @@ def procs_strip(rows, n=5, fill=None, show_energy=False):
                  key=lambda r: -max(r.get("cpu_pct") or 0, r.get("gpu_pct") or 0))[:n]
     if fill:
         fill(top)         # measure GPU memory for these five only, never all 400
-    cols = STRIP_COLS + ((STRIP_ENERGY_COL,) if show_energy else ())
+    cols = STRIP_COLS
     head = f"     {'BUSIEST':<{STRIP_NAME_W}}" + "".join(f"{h:>9}" for h, _ in cols)
     out = [c("90", head)]
     span = max(len(top) - 1, 1)
@@ -1367,7 +1268,7 @@ def procs_strip(rows, n=5, fill=None, show_energy=False):
 
 
 def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
-                show_energy=False, name_w=34):
+                name_w=34):
     """Header of global state, then a sorted, scrollable window of processes."""
     # One system total per column below, in the same order, so the header reads
     # as the totals row of the table rather than an unrelated status line.
@@ -1394,14 +1295,13 @@ def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
     name_w = max(12, min(name_w, longest + 1))
     shown = f"{off + 1}-{off + len(window)} of {len(ordered)}" if window else "none"
     # keys listed in COLUMN order, so which key sorts which column is positional
-    keys = "c/m/g/v" + ("/e" if show_energy else "") + "/p/n"
+    keys = "c/m/g/v/w/p/n"
     nav = _fit([shown, "jk/↑↓ scroll", f"{keys} sort (again flips)", "q quit"],
                shutil.get_terminal_size().columns - 1)
-    return (head + proc_table(window, sort_key, reverse, name_w=name_w,
-                              show_energy=show_energy) + [c("90", nav)])
+    return head + proc_table(window, sort_key, reverse, name_w=name_w) + [c("90", nav)]
 
 
-def procs(seconds, interval_ms, want_energy=False):
+def procs(seconds, interval_ms):
     """Live per-process view.
 
     Ranked by CPU by default. With --energy it also shows Apple's Energy Impact
@@ -1414,46 +1314,30 @@ def procs(seconds, interval_ms, want_energy=False):
         sys.exit(f"pdraw: cannot read power — {e}")
     host, bat_cache, source = host_or_none(), BatteryCache(), Processes()
     gpumem = GpuMemCache()
-    pm, quiet = None, True
-    have_pm = bool(shutil.which("powermetrics"))
-    if want_energy and not have_pm:
-        sys.exit("pdraw: powermetrics not found (it ships with macOS)")
-    # Free upgrade: if sudo needs no password right now (cached credential or a
-    # NOPASSWD rule), show IMPACT without being asked. Only an actual prompt is
-    # worth making someone opt in to.
-    if have_pm and (want_energy or sudo_passwordless(PowerMetrics.argv())):
-        # Prime sudo BEFORE the alt-screen: the prompt must land on the real
-        # screen, and caching lets the child's noisy stderr be silenced.
-        quiet = sudo_prime(PowerMetrics.argv())
-        if not quiet:
-            print("pdraw: sudo not cached — powermetrics warnings will show.")
-        pm = PowerMetrics(quiet=quiet)
-    show_energy = pm is not None
 
     def _on_term(*_):
         raise KeyboardInterrupt
 
     keys = None
     off, start, frame, done = 0, time.monotonic(), [], False
-    sort_key, reverse = ("energy" if show_energy else "cpu_pct"), True
+    sort_key, reverse = "cpu_pct", True
     source.sample()          # CPU is a delta; discard the baseline sample
 
     def view_rows():
         return max(3, shutil.get_terminal_size().lines - 10)
 
     def name_width():
-        fixed = 5 + 7 + 2 + 8 + 8 + 8 + 9 + (10 if show_energy else 0)
+        fixed = 5 + 7 + 2 + 8 + 8 + 8 + 9 + 9
         return max(12, shutil.get_terminal_size().columns - fixed)
 
     def render(rows, sample):
         out = procs_lines(rows, sample.get("gpu"), sample, view_rows(), off,
-                          sort_key, reverse, show_energy=show_energy,
-                          name_w=name_width())
+                          sort_key, reverse, name_w=name_width())
         cols = shutil.get_terminal_size().columns
         note = _fit([time.strftime("%H:%M:%S"),
                      "GPUMEM is user-mapped, it does not sum to the header",
-                     ("IMPACT is relative, not watts" if show_energy
-                      else "IMPACT needs --energy")], cols)
+                     "POWER is energy caused, so it does not sum to system draw"],
+                    cols)
         out += ["", c("90", note)]
         if TTY:
             sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in out) + "\x1b[J")
@@ -1475,8 +1359,6 @@ def procs(seconds, interval_ms, want_energy=False):
             rows = source.sample()
             gpumem.refresh(source.gpu_holders)
             gpumem.apply(rows, source.gpu_holders)
-            if pm:
-                rows = merge_energy(rows, pm.poll())
             frame = render(rows, sample)
             # poll keys far faster than we sample: navigation that lagged a whole
             # refresh would feel broken
@@ -1491,8 +1373,6 @@ def procs(seconds, interval_ms, want_energy=False):
                             if a == "reverse":
                                 reverse = not reverse
                             elif a in SORT_KEYS:
-                                if SORT_KEYS[a] == "energy" and not show_energy:
-                                    continue          # column isn't shown
                                 sort_key, reverse = next_sort(sort_key, reverse, a)
                                 off = 0               # new ordering starts at its top
                             else:
@@ -1510,10 +1390,6 @@ def procs(seconds, interval_ms, want_energy=False):
         if TTY:
             sys.stdout.write("\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
-        left = pm.close() if pm else None
-        if left:   # root-owned survivor we cannot kill ourselves — say so
-            print(f"pdraw: powermetrics still running as root (pid {' '.join(left)}); "
-                  f"stop it with: sudo kill {' '.join(left)}")
     if not TTY and frame:
         print("\n".join(frame))
 
@@ -1684,6 +1560,17 @@ def selftest():
     assert abs(_gpu_percent(500_000_000, 2.0) - 25.0) < 0.01
     assert _gpu_percent(0, 1.0) == 0.0
 
+    # per-process power in WATTS, from proc_pid_rusage's nanojoule counter. A
+    # real physical unit, unlike powermetrics' unitless Energy Impact score --
+    # and no sudo. Validated against known load: one pinned core reported 8.2 W
+    # while the machine's own draw rose 10.6 W, four cores 15.8 W against 23.6.
+    assert proc_energy_nj(os.getpid()) > 0
+    assert proc_energy_nj(1) is None                  # root-owned, unreadable
+    assert _watts(2_000_000_000, 2.0) == 1.0          # 2 J over 2 s
+    assert _watts(1_000_000_000, 1.0) == 1.0
+    assert _watts(0, 1.0) == 0.0
+    assert _watts(-5, 1.0) == 0.0, "counter reset must not read as negative power"
+
     # per-process GPU memory: VM regions tagged VM_MEMORY_IOACCELERATOR (100) or
     # IOSURFACE (88). Real and sudo-free, but ~15ms a process (one syscall per
     # region, no bulk API), so it is measured only for rows on screen and cached.
@@ -1724,15 +1611,15 @@ def selftest():
     gm.refresh([1])
     assert 2 not in gm._val, "and 2 goes once it too is genuinely stale"
 
-    # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
-    # needs root, so it must not hold the whole view hostage
+    # every per-process figure comes from libproc with no privileges: CPU,
+    # memory, GPU time, GPU-tagged memory, and power in real watts
     src = Processes()
     src.sample()                       # first sample establishes the CPU baseline
     live_rows = src.sample()
     assert live_rows, "libproc must enumerate our processes"
-    assert all({"pid", "name", "cpu_pct", "rss_mb"} <= set(r) for r in live_rows)
+    assert all({"pid", "name", "cpu_pct", "rss_mb", "power_w"} <= set(r) for r in live_rows)
     assert any(r["pid"] == os.getpid() for r in live_rows), "our own process must appear"
-    assert all(r["energy"] is None for r in live_rows), "no energy without powermetrics"
+
     # Rows are either fully readable (ours), or GPU-only entries for processes we
     # cannot read but which hold GPU clients -- WindowServer being the obvious
     # one. Those show unknown for CPU and memory rather than a fabricated 0.
@@ -1741,31 +1628,26 @@ def selftest():
     assert readable, "libproc must give us our own processes"
     assert all(r["cpu_pct"] is None for r in gpu_only), "unreadable CPU stays unknown"
     assert all(r["gpu_pct"] is not None for r in live_rows), "GPU is known for all"
+    assert all(r["power_w"] is not None for r in readable), "power needs no sudo"
+    assert all(r["power_w"] is None for r in gpu_only), "unreadable power stays unknown"
 
-    # energy merges in by pid when powermetrics IS available
-    merged = merge_energy([{"pid": 11, "energy": None}, {"pid": 99, "energy": None}],
-                          {"tasks": [{"pid": 11, "energy_impact_per_s": 7.5},
-                                     {"pid": -1, "energy_impact_per_s": 999.0}]})
-    assert merged[0]["energy"] == 7.5, merged
-    assert merged[1]["energy"] is None, "pid absent from the frame stays unknown"
-
-    # units belong in the header, not repeated per row; and IMPACT is Apple's
-    # unitless Energy Impact score -- NOT watts (measured: task impacts sum to
-    # 464-2223 while the machine drew 20-40 W, and impact/cpu varies 36x)
-    trows = [{"pid": 11, "name": "python3.12", "cpu_pct": 142.3, "energy": 88.4,
+    # units belong in the header, not repeated per row. POWER replaced Apple's
+    # Energy Impact, which was a unitless composite: impacts summed to 464-2223
+    # while the machine drew 20-40 W, and impact-per-cpu-ms varied 36x.
+    trows = [{"pid": 11, "name": "python3.12", "cpu_pct": 142.3, "power_w": 88.4,
               "rss_mb": 8600.0, "rss_pct": 17.5},
-             {"pid": 1258, "name": "WindowServer", "cpu_pct": 9.9, "energy": 3.1,
+             {"pid": 1258, "name": "WindowServer", "cpu_pct": 9.9, "power_w": 3.1,
               "rss_mb": None, "rss_pct": None},
-             {"pid": 987, "name": "distnoted", "cpu_pct": 0.4, "energy": 0.1,
+             {"pid": 987, "name": "distnoted", "cpu_pct": 0.4, "power_w": 0.1,
               "rss_mb": 1.5, "rss_pct": 0.0}]
     tbl = proc_table(trows)
     hdr = next(l for l in tbl if "PID" in l)
     # the TABLE shows memory as % of installed RAM; the ram LANE keeps GB, since
     # a time-series reads better in absolute units than in percent
-    assert "IMPACT/s" in hdr and "MEM%" in hdr and "CPU%" in hdr, hdr
+    assert "POWER W" in hdr and "MEM%" in hdr and "CPU%" in hdr, hdr
     assert "MEM MB" not in hdr, hdr
     assert INSTALLED_RAM_GB > 0, INSTALLED_RAM_GB
-    assert "ENERGY" not in hdr, "ENERGY reads as watts; it is a unitless score"
+    assert "IMPACT" not in hdr, "replaced by real watts from proc_pid_rusage"
     body = next(l for l in tbl if "python3.12" in l)
     assert "17.5" in body, body                          # percent, unit in header
     assert "—" in next(l for l in tbl if "WindowServer" in l)
@@ -1788,7 +1670,7 @@ def selftest():
     assert "▲" in up, up
 
     # pressing a sort key twice flips direction; a different key starts descending
-    assert next_sort("energy", True, "sort_cpu") == ("cpu_pct", True)
+    assert next_sort("power_w", True, "sort_cpu") == ("cpu_pct", True)
     assert next_sort("cpu_pct", True, "sort_cpu") == ("cpu_pct", False)
     assert next_sort("cpu_pct", False, "sort_cpu") == ("cpu_pct", True)
     assert next_sort("cpu_pct", False, "sort_mem") == ("rss_pct", True)
@@ -1815,48 +1697,6 @@ def selftest():
     assert parse_keys("e") == ["sort_energy"]
     assert parse_keys("m") == ["sort_mem"]
     assert parse_keys("r") == ["reverse"]
-
-    # powermetrics -f plist emits NUL-separated frames. The reader must yield only
-    # complete frames and hold a partial tail across chunk boundaries -- a frame
-    # split mid-XML is the normal case when reading a pipe, not an edge case.
-    f1 = plistlib.dumps({"tasks": [{"pid": 1, "name": "a"}]})
-    f2 = plistlib.dumps({"tasks": [{"pid": 2, "name": "b"}]})
-    fr = PlistFrames()
-    assert fr.feed(f1[:20]) == [], "partial frame must yield nothing"
-    assert fr.feed(f1[20:] + b"\x00")[0]["tasks"][0]["pid"] == 1
-    both = fr.feed(f2 + b"\x00" + f1 + b"\x00")
-    assert [d["tasks"][0]["pid"] for d in both] == [2, 1], both
-    assert fr.feed(f2[:10]) == []                       # tail held, not lost
-    assert fr.feed(f2[10:] + b"\x00")[0]["tasks"][0]["pid"] == 2
-    assert fr.feed(b"not a plist\x00") == [], "garbage frame skipped, stream survives"
-    assert fr.dropped == 1, fr.dropped   # counted, not silently swallowed
-    # real powermetrics output does NOT put a NUL after its last frame (verified
-    # against a captured fixture), so a NUL-only reader silently loses it
-    tail_fr = PlistFrames()
-    both2 = tail_fr.feed(f1 + b"\x00" + f2)          # note: no trailing NUL
-    assert len(both2) == 2, f"unterminated final frame lost: got {len(both2)}"
-    assert [d["tasks"][0]["pid"] for d in both2] == [1, 2], both2
-    assert tail_fr.feed(b"") == [], "already-emitted tail must not repeat"
-
-    # the loop must sleep the REMAINDER of the interval, not the whole thing, or
-    # the real period becomes work+interval (measured 2074ms against a 2000ms
-    # target across 291 samples -- ~22s of skew over a 10 minute run)
-    napped = []
-    assert sleep_remainder(100.0, 2000, clock=lambda: 100.5, sleep=napped.append) == 1.5
-    assert napped == [1.5], napped
-    napped.clear()
-    assert sleep_remainder(100.0, 2000, clock=lambda: 103.0, sleep=napped.append) == 0.0
-    assert napped == [], "work overran the interval -> no sleep, never negative"
-
-    # the default poll period must outlast a slow tick, or the cache is inert:
-    # at -i 2000 a 2s period re-read on every single tick (measured 291/291)
-    ticks, reads = [0.0], []
-    slow = BatteryCache(read=lambda: (reads.append(1), {"battery": {}})[1],
-                        clock=lambda: ticks[0])          # default BATTERY_POLL_S
-    for _ in range(4):
-        slow.get()
-        ticks[0] += 2.0
-    assert len(reads) < 4, f"default poll inert at a 2s tick: {len(reads)}/4 re-reads"
 
     # key parsing: arrows arrive as ESC [ A/B, and several keys can land in one
     # read, so the buffer must be consumed as a sequence not a single char
@@ -1897,14 +1737,6 @@ def selftest():
     # same columns as `pdraw procs`, in the same order
     for col in ("CPU%", "MEM%", "GPU%", "GPUMEM%"):
         assert col in tiny[0], (col, tiny[0])
-    # IMPACT only with --energy, exactly as in `pdraw procs`: it is the one
-    # column needing powermetrics as root, and bare `pdraw` spawns no root child
-    assert "IMPACT/s" not in tiny[0], tiny[0]
-    withe = procs_strip([{"pid": 1, "name": "ab", "cpu_pct": 1.0, "gpu_pct": 0.0,
-                          "energy": 5.0}], n=1, show_energy=True)
-    assert "IMPACT/s" in withe[0], withe[0]
-    assert len(withe[0]) > len(tiny[0]), "the column takes room when present"
-
     # the header must state a system total for every column the table shows per
     # process. CPU and memory were missing while GPU and power were present.
     hsample = {"host": {"cpu_pct": 24.0, "ram_gb": 43.0}, "ram_total_gb": 48.0,
@@ -1912,7 +1744,7 @@ def selftest():
                "sys_power_w": 32.0, "adapter_power_w": 0.0, "compute_w": 1.0,
                "battery_flow_w": 0.0}
     hline = procs_lines([{"pid": 1, "name": "x", "cpu_pct": 1.0, "gpu_pct": 0.0,
-                          "rss_pct": 0.1, "rss_mb": 1.0, "energy": None}],
+                          "rss_pct": 0.1, "rss_mb": 1.0, "power_w": 0.0}],
                         hsample["gpu"], hsample, view=3)[1]
     for token in ("CPU 24%", "GPU 56%", "32 W"):
         assert token in hline, (token, hline)
@@ -1956,21 +1788,6 @@ def selftest():
     assert scroll_clamp(50, "top", rows=100, view=10) == 0
     assert scroll_clamp(0, "bottom", rows=100, view=10) == 90
     assert scroll_clamp(0, "bottom", rows=5, view=10) == 0, "list shorter than view"
-
-    # stream driver: newest frame wins, and a tick with no new data keeps the
-    # previous one rather than blanking the table
-    class _Chunks:
-        def __init__(self, *bufs):
-            self._bufs = list(bufs)
-
-        def read(self):
-            return self._bufs.pop(0) if self._bufs else b""
-
-    pm = PowerMetrics(stream=_Chunks(f1 + b"\x00", f2 + b"\x00", b""))
-    assert pm.poll()["tasks"][0]["pid"] == 1
-    assert pm.poll()["tasks"][0]["pid"] == 2
-    assert pm.poll()["tasks"][0]["pid"] == 2, "no new frame -> hold the last"
-    assert pm.close() is None, "no child was spawned, so nothing to reap"
 
     # battery is re-read on wall-clock, not per tick: the gauge moves every ~35s
     # (measured), so per-tick polling re-forked ioreg ~70x per real change
@@ -2023,16 +1840,13 @@ def main():
     ap.add_argument("-i", "--interval", type=int, default=500, metavar="MS",
                     help="sample interval ms (default 500)")
     ap.add_argument("--json", action="store_true", help="print one sample as JSON")
-    ap.add_argument("--energy", action="store_true",
-                    help="add Apple's Energy Impact column to the process rows "
-                         "(needs sudo; without it pdraw never runs anything as root)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
     if args.cmd == "procs":
-        return procs(args.watch, args.interval, args.energy)
+        return procs(args.watch, args.interval)
     if args.cmd == "top":
         if not shutil.which("mactop"):
             sys.exit("pdraw: mactop not installed — brew install mactop")
@@ -2050,7 +1864,7 @@ def main():
         else:
             snapshot(sample)
         return
-    return watch(args.watch, args.interval, args.log, args.energy)
+    return watch(args.watch, args.interval, args.log)
 
 
 if __name__ == "__main__":

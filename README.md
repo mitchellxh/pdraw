@@ -25,10 +25,9 @@ pdraw -i 250       # sample interval in ms (default 500)
 pdraw -s           # one-shot snapshot
 pdraw --json       # one sample as JSON
 pdraw --selftest   # built-in checks
-pdraw procs        # per-process CPU% / MEM% / GPU% / GPUMEM (no sudo)
+pdraw procs        # per-process CPU% / MEM% / GPU% / GPUMEM% / POWER W
+                   #   sort: c cpu · m mem · g gpu · v gpumem · w power
                    #   sort: c cpu · g gpu · m mem · v gpumem · p pid · n name
-pdraw --energy     # ...plus Apple's Energy Impact on those rows (uses sudo)
-pdraw procs --energy  # ...same, on the full table
 pdraw top          # run mactop, if installed
 ```
 
@@ -86,10 +85,7 @@ exactly the case it is most useful for. `pdraw procs` has the full table.
 
 ## `pdraw procs` — who is using the machine
 
-Bare `pdraw` never uses sudo. `pdraw procs` does, and it is the only path that
-does: per-process energy comes from `powermetrics`, which requires root. It
-spawns one long-lived `powermetrics` and reads its plist stream, rather than
-re-running it each tick.
+Nothing here needs sudo. Every per-process figure comes from `libproc`.
 
 ```
   ●  GPU 32% · gpu mem 1.9 GB · 20 W draw
@@ -101,10 +97,22 @@ re-running it each tick.
        67203  Moonlight                      282.9     94.9     73M
 ```
 
-**Ranked by energy, not CPU.** Low CPU is the *absence* of a signal: it cannot
-tell an idle daemon from a job that has handed its work to the GPU. Energy rises
-for either. In the sample above `Moonlight` has 2.5x the CPU of `stable` but a
-third of the energy — sorting by CPU would put the wrong process on top.
+### `POWER W` — real watts, no root
+
+`proc_pid_rusage(pid, RUSAGE_INFO_V6)` exposes `ri_energy_nj`, a monotonic
+nanojoule counter. Differentiated over wall time that is watts — an actual
+physical unit, readable without privileges.
+
+It replaced Apple's Energy Impact, which `powermetrics` reports and which needed
+root. Energy Impact is a unitless composite: measured here, per-task impacts
+summed to 464–2223 while the machine drew 20–40 W, and impact per CPU-millisecond
+varied 36× across tasks. It ranked processes; it did not measure anything.
+
+`POWER` attributes the energy a process *causes*, so it does not sum to system
+draw — much of that is baseline (display, memory, idle rails) owned by no
+process. Validated against known load: one pinned core reported 8.2 W while the
+machine's own draw rose 10.6 W; four cores, 15.8 W against 23.6 — roughly 70% of
+the marginal power a busy process adds.
 
 **Per-process GPU comes from `AGXDeviceUserClient` nodes in the IORegistry**,
 which carry the owning pid and accumulated Metal GPU time in nanoseconds. No
