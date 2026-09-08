@@ -110,10 +110,12 @@ the obvious places and wrongly conclude it does not exist.
 Processes that hold GPU clients but are not ours to read — `WindowServer` above
 all — are still listed, with `—` for CPU and memory.
 
-### `GPUMEM` — what it is, and what it is not
+### `GPUMEM%` — what it is, and what it is not
 
-`GPUMEM` sums a process's VM regions tagged `VM_MEMORY_IOACCELERATOR` (100) or
+`GPUMEM%` sums a process's VM regions tagged `VM_MEMORY_IOACCELERATOR` (100) or
 `VM_MEMORY_IOSURFACE` (88), via `proc_pidinfo(PROC_PIDREGIONINFO)`. No sudo.
+It is shown as a percentage of installed memory — the same denominator as
+`MEM%`, because unified memory means GPU allocations *are* system pages.
 
 **It is user-mapped GPU memory only, and does not sum to the header's `gpu mem`.**
 Measured across every process holding GPU clients it came to 0.33 GB while

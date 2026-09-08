@@ -290,7 +290,7 @@ _CSI = {"A": "up", "B": "down", "H": "top", "F": "bottom",
         "1~": "top", "4~": "bottom", "5~": "pgup", "6~": "pgdn"}
 SORT_KEYS = {"sort_cpu": "cpu_pct", "sort_gpu": "gpu_pct", "sort_energy": "energy",
              "sort_mem": "rss_pct", "sort_pid": "pid", "sort_name": "name",
-             "sort_gpumem": "gpu_mb"}
+             "sort_gpumem": "gpu_mem_pct"}
 
 def parse_keys(buf):
     """Actions for a raw key buffer; unknown keys are ignored, never fatal."""
@@ -439,7 +439,7 @@ _COLS = (("PID", 7, "pid", lambda v: f"{v:d}"),
          ("CPU%", 8, "cpu_pct", lambda v: f"{v:.1f}"),
          ("MEM%", 8, "rss_pct", lambda v: f"{v:.1f}"),
          ("GPU%", 8, "gpu_pct", lambda v: f"{v:.1f}"),
-         ("GPUMEM", 9, "gpu_mb", lambda v: f"{v:.0f}M"),
+         ("GPUMEM%", 9, "gpu_mem_pct", lambda v: f"{v:.1f}"),
          ("IMPACT/s", 10, "energy", lambda v: f"{v:.1f}"))
 
 
@@ -615,7 +615,11 @@ class GpuMemCache:
             live.add(pid)
             if now - self._at.get(pid, -1e9) >= self._period:
                 self._val[pid], self._at[pid] = self._read(pid), now
-            r["gpu_mb"] = self._val.get(pid)
+            mb = self._val.get(pid)
+            r["gpu_mb"] = mb
+            # % of installed RAM, the same denominator as MEM%: unified memory
+            # means GPU allocations are system pages, so the two are comparable
+            r["gpu_mem_pct"] = None if mb is None else mb / 1024 / INSTALLED_RAM_GB * 100
         for gone in set(self._val) - live:     # rows scrolled away; do not grow
             self._val.pop(gone, None)
             self._at.pop(gone, None)
@@ -1281,7 +1285,11 @@ def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
         ram = lane_values(s)["ram"]        # GPU-excluded, matching the ram lane
         bits.append(f"mem {ram:.1f}/{total:.0f} GB" if total else f"mem {ram:.1f} GB")
     if gpu:
-        bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gpu['mem_inuse_gb']:.1f} GB"]
+        # same /total: on unified memory the GPU draws from the one pool, and
+        # showing a bare figure hid that mem + gpu mem is the machine's usage
+        gmem = f"{gpu['mem_inuse_gb']:.1f}/{total:.0f} GB" if host and total \
+            else f"{gpu['mem_inuse_gb']:.1f} GB"
+        bits += [f"GPU {gpu['util_pct']:.0f}%", f"gpu mem {gmem}"]
     bits.append(f"{s['sys_power_w']:.0f} W draw")
     head = ["", _fit(bits, shutil.get_terminal_size().columns - 1)
             .replace("     ", f"  {c('32', '●')}  ", 1), ""]
@@ -1292,11 +1300,12 @@ def procs_lines(rows, gpu, s, view=12, off=0, sort_key="cpu_pct", reverse=True,
     if fill:
         fill(window)          # GPU memory is expensive; only measure what shows
     shown = f"{off + 1}-{off + len(window)} of {len(ordered)}" if window else "none"
-    keys = "c/g/m/v/p/n" + ("/e" if show_energy else "")
-    nav = f" · jk/↑↓ scroll · {keys} sort (again to flip) · q quit"
+    # keys listed in COLUMN order, so which key sorts which column is positional
+    keys = "c/m/g/v" + ("/e" if show_energy else "") + "/p/n"
+    nav = _fit([shown, "jk/↑↓ scroll", f"{keys} sort (again flips)", "q quit"],
+               shutil.get_terminal_size().columns - 1)
     return (head + proc_table(window, sort_key, reverse, name_w=name_w,
-                              show_energy=show_energy)
-            + ["     " + c("90", shown + nav)])
+                              show_energy=show_energy) + [c("90", nav)])
 
 
 def procs(seconds, interval_ms, want_energy=False):
@@ -1754,9 +1763,12 @@ def selftest():
     hline = procs_lines([{"pid": 1, "name": "x", "cpu_pct": 1.0, "gpu_pct": 0.0,
                           "rss_pct": 0.1, "rss_mb": 1.0, "energy": None}],
                         hsample["gpu"], hsample, view=3)[1]
-    for token in ("CPU 24%", "GPU 56%", "gpu mem 30.1", "32 W"):
+    for token in ("CPU 24%", "GPU 56%", "32 W"):
         assert token in hline, (token, hline)
-    assert "12.9" in hline, ("ram must be the GPU-excluded figure", hline)
+    assert "12.9/48" in hline, ("ram: GPU-excluded, against installed", hline)
+    # unified memory: gpu mem comes out of the SAME pool, so it carries the same
+    # denominator. 12.9 + 30.1 = 43.0, which is what the system reports used.
+    assert "30.1/48" in hline, ("gpu mem shares the pool", hline)
 
     # the footer must not overflow a narrow terminal: keep what fits, drop the
     # rest, most important first (measured: the full note ran 106 cols at 80)
