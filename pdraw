@@ -619,7 +619,11 @@ class GpuMemCache:
         due.sort(key=lambda p: self._at.get(p, -1e9))
         for pid in due[:self._budget]:
             self._val[pid], self._at[pid] = self._read(pid), now
-        for gone in set(self._val) - set(pids):      # process exited; do not grow
+        # Evict by age, not by absence. A pid that scrolled out of view is very
+        # likely to scroll back, and re-measuring costs ~15ms; only forget the
+        # ones that have not been asked about for several periods.
+        stale = now - self._period * 6
+        for gone in [p for p, at in self._at.items() if at < stale and p not in pids]:
             self._val.pop(gone, None)
             self._at.pop(gone, None)
 
@@ -1216,6 +1220,7 @@ def watch(seconds, interval_ms, log_path=None):
     host = host_or_none()
     bat_cache = BatteryCache()   # the gauge moves every ~35s; don't fork ioreg per tick
     procs_src = Processes()
+    strip_gpumem = GpuMemCache()      # only ever asked about the five rows shown
     term = shutil.get_terminal_size()
     _rows = grid_rows(sep=True)
     _blanks = _rows.count(None)
@@ -1265,8 +1270,14 @@ def watch(seconds, interval_ms, log_path=None):
                                                        rated, total_gb) for k in row))
                 if caps[name]:                # group-scoped state, under its band
                     frame.append(caps[name])
+            def _fill(top):
+                # the band does not sort on GPU memory, so unlike `pdraw procs`
+                # it only needs the rows it is about to draw -- five, not ~68
+                strip_gpumem.refresh([r["pid"] for r in top])
+                strip_gpumem.apply(top, procs_src.gpu_holders)
+
             # only pay for the process walk when the band will actually be drawn
-            strip = procs_strip(procs_src.sample(), STRIP_N, term.columns) \
+            strip = procs_strip(procs_src.sample(), STRIP_N, fill=_fill) \
                 if show_strip else []
             if strip:
                 frame += [""] + strip
@@ -1310,21 +1321,34 @@ def _fit(parts, width):
     return ("     " + " · ".join(out))[:width]
 
 
-def procs_strip(rows, n=5, width=80):
-    """The default view's process band: the busiest few, and nothing else.
+STRIP_NAME_W = 24     # fixed: a width that tracked the names reflowed the band
+                      # every time the busiest process changed
+STRIP_COLS = (("CPU%", "cpu_pct"), ("MEM%", "rss_pct"),
+              ("GPU%", "gpu_pct"), ("GPUMEM%", "gpu_mem_pct"))
+
+
+def procs_strip(rows, n=5, fill=None):
+    """The default view's process band: the busiest few, same columns as `procs`.
 
     Ranked by whichever of CPU or GPU is higher. Sorting on CPU alone would hide
     a GPU-bound job sitting at 2% CPU, which is the case this is most useful for.
     """
     if not rows:
         return []
-    top = sorted(rows, key=lambda r: -max(r.get("cpu_pct") or 0, r.get("gpu_pct") or 0))
-    name_w = max(12, min(width - 22, max(len(r["name"]) for r in top[:n]) + 1))
-    out = [c("90", f"     {'BUSIEST':<{name_w}}{'CPU%':>8}{'GPU%':>8}")]
-    for r in top[:n]:
-        cpu = "—" if r.get("cpu_pct") is None else f"{r['cpu_pct']:.1f}"
-        gpu = "—" if r.get("gpu_pct") is None else f"{r['gpu_pct']:.1f}"
-        out.append(f"     {r['name'][:name_w]:<{name_w}}{cpu:>8}{gpu:>8}")
+    top = sorted(rows,
+                 key=lambda r: -max(r.get("cpu_pct") or 0, r.get("gpu_pct") or 0))[:n]
+    if fill:
+        fill(top)         # measure GPU memory for these five only, never all 400
+    head = f"     {'BUSIEST':<{STRIP_NAME_W}}" + "".join(f"{h:>9}" for h, _ in STRIP_COLS)
+    out = [c("90", head)]
+    span = max(len(top) - 1, 1)
+    for i, r in enumerate(top):
+        cells = "".join(f"{('—' if r.get(k) is None else format(r[k], '.1f')):>9}"
+                        for _, k in STRIP_COLS)
+        # already ordered by the ranking metric, so position IS the rank: hottest
+        # at the top, cooling down the band, same ramp as the procs table
+        shade = _heat(1.0 - i / span)
+        out.append("     " + c(shade, f"{r['name'][:STRIP_NAME_W]:<{STRIP_NAME_W}}{cells}"))
     return out
 
 
@@ -1676,8 +1700,15 @@ def selftest():
     gm.refresh([1, 2, 3, 4, 5])
     assert len(calls) == 7, "stale again, still bounded"
     assert gm.get(1) == 4.0 and gm.get(404) is None
-    gm.refresh([1])                       # 404 is gone; do not grow forever
-    assert 404 not in gm._val
+    # pruning is by AGE, not membership: the band's top five churns, and evicting
+    # a pid the moment it drops out meant re-measuring it (~15ms) when it came
+    # back a frame later -- measured 54.8ms a frame before this
+    gm.refresh([1])            # pids 2..5 just dropped out of the list
+    assert 2 in gm._val, "a pid measured moments ago is still worth keeping"
+    assert 3 not in gm._val, "one measured long ago and now absent is dropped"
+    tick[0] += 5.0 * 7
+    gm.refresh([1])
+    assert 2 not in gm._val, "and 2 goes once it too is genuinely stale"
 
     # per-process CPU + memory with NO sudo, via libproc: only the IMPACT column
     # needs root, so it must not hold the whole view hostage
@@ -1836,13 +1867,22 @@ def selftest():
              {"pid": 2, "name": "busy-gpu", "cpu_pct": 1.0, "gpu_pct": 90.0},
              {"pid": 3, "name": "idle", "cpu_pct": 0.2, "gpu_pct": 0.0},
              {"pid": 4, "name": "middling", "cpu_pct": 30.0, "gpu_pct": 5.0}]
-    strip = procs_strip(srows, n=3, width=60)
+    strip = procs_strip(srows, n=3)
     assert len(strip) == 4, strip                    # one header + three rows
     assert "PID" not in "".join(strip) and "─" not in "".join(strip[1:])
     # ranked by whichever of cpu/gpu is higher, so a GPU-bound job with almost no
     # CPU still shows up -- sorting on CPU alone would hide exactly that case
     assert [l.split()[0] for l in strip[1:]] == ["busy-gpu", "busy-cpu", "middling"], strip
-    assert procs_strip([], n=3, width=60) == [], "nothing to say, say nothing"
+    assert procs_strip([], n=3) == [], "nothing to say, say nothing"
+    # the band must not breathe: its width cannot depend on the names in it, or
+    # it reflows every time the busiest process changes
+    tiny = procs_strip([{"pid": 1, "name": "ab", "cpu_pct": 1.0, "gpu_pct": 0.0}], n=1)
+    huge = procs_strip([{"pid": 1, "name": "z" * 60, "cpu_pct": 1.0, "gpu_pct": 0.0}], n=1)
+    assert len(tiny[0]) == len(huge[0]) == len(tiny[1]) == len(huge[1]), \
+        [len(x) for x in (tiny[0], huge[0], tiny[1], huge[1])]
+    # same columns as `pdraw procs`, in the same order
+    for col in ("CPU%", "MEM%", "GPU%", "GPUMEM%"):
+        assert col in tiny[0], (col, tiny[0])
 
     # the header must state a system total for every column the table shows per
     # process. CPU and memory were missing while GPU and power were present.
